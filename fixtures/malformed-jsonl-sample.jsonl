@@ -1,0 +1,3 @@
+{"timestamp":"2026-04-23T00:42:27.472Z","type":"session_meta","payload":{"id":"broken-session","timestamp":"2026-04-23T00:42:18.202Z","cwd":"D:\\Codes\\broken_project","originator":"Codex Desktop"}}
+this is not valid json
+{"timestamp":"2026-04-23T00:42:28.014Z","type":"event_msg","payload":{"type":"agent_message","message":"still parsable after a bad line","phase":"final_answer"}}

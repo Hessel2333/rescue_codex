@@ -1,0 +1,14 @@
+{
+  "thread": "manual-import",
+  "updated_at": "2026-04-23T10:00:00Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Summarize the changelog"
+    },
+    {
+      "role": "assistant",
+      "content": "Here is a short summary."
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeDevCommand": "scripts\\dev.cmd",
+    "beforeBuildCommand": "scripts\\build.cmd"
+  }
+}

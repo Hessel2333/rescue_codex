@@ -1,0 +1,20 @@
+node_modules/
+dist/
+
+# Tauri / Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# Local runtime data
+src-tauri/*.db
+src-tauri/*.sqlite
+src-tauri/*.sqlite-*
+
+# Logs and incremental compiler output
+*.log
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Local installers / machine-specific bootstrap files
+*.exe
