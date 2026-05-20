@@ -2,5 +2,10 @@
   "build": {
     "beforeDevCommand": "sh ./scripts/dev.sh",
     "beforeBuildCommand": "sh ./scripts/build.sh"
+  },
+  "bundle": {
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }
