@@ -93,6 +93,9 @@ CREATE TABLE IF NOT EXISTS session_events_raw (
 CREATE INDEX IF NOT EXISTS idx_session_events_lookup
   ON session_events_raw(session_id, outer_type, inner_type);
 
+CREATE INDEX IF NOT EXISTS idx_session_events_session_seq
+  ON session_events_raw(session_id, seq);
+
 CREATE TABLE IF NOT EXISTS session_messages (
   id TEXT PRIMARY KEY,
   session_id TEXT NOT NULL,

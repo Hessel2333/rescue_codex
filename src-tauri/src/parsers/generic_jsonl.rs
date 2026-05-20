@@ -1,7 +1,9 @@
 use crate::models::parser::{
     ParseContext, ParseResult, ParseWarning, ParsedRawEvent, ParserTarget,
 };
-use crate::parsers::{finalize_session, generic_message_from_value, SessionSeed, SourceParser};
+use crate::parsers::{
+    compact_json_string, finalize_session, generic_message_from_value, SessionSeed, SourceParser,
+};
 use serde_json::Value;
 use std::{
     fs::File,
@@ -90,7 +92,7 @@ impl SourceParser for GenericJsonlParser {
                     .and_then(|payload| payload.get("type"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-                payload_json: serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
+                payload_json: compact_json_string(&value),
                 warning_code: None,
             });
 

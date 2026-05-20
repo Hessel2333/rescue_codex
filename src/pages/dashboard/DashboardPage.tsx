@@ -1,15 +1,14 @@
-import { Download, FileJson2, FileText } from "lucide-react";
-import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { OverviewCharts } from "../../features/dashboard/ChartsPanel";
+import { DashboardHeaderActions } from "../../features/dashboard/DashboardHeaderActions";
 import { AnalyticsToolbar } from "../../features/dashboard/AnalyticsToolbar";
 import { OverviewCards } from "../../features/dashboard/OverviewCards";
 import { useDashboardControls } from "../../features/dashboard/dashboardControls";
 import { useDashboardSummary } from "../../features/dashboard/useDashboardSummary";
+import { ImportProgress, ImportStatusBadge } from "../../features/imports/ImportProgress";
 import { formatDateTime, formatDuration, formatNumber, formatOptionalText } from "../../lib/format";
 import { sanitizeMessagePreview } from "../../lib/sessionVisibility";
-import { exportReport, pickSavePath } from "../../lib/tauri";
 
 function AccountValue({ label, value }: { label: string; value?: string | null }) {
   return (
@@ -34,20 +33,6 @@ export function DashboardPage() {
   } = useDashboardControls();
   const { summary, loading, error, refresh } = useDashboardSummary(filters, "overview");
 
-  async function handleExport(format: "json" | "markdown") {
-    const path = await pickSavePath(`rescue_codex-dashboard.${format === "markdown" ? "md" : format}`);
-    if (!path) {
-      return;
-    }
-
-    await exportReport({
-      kind: "dashboard",
-      format,
-      path,
-      dashboardFilters: filters,
-    });
-  }
-
   const availableFrom = summary?.scope.availableFrom;
   const availableTo = summary?.scope.availableTo;
   const currentScopeText = summary ? `${summary.scope.dateFrom} 至 ${summary.scope.dateTo}` : "载入中";
@@ -62,19 +47,7 @@ export function DashboardPage() {
         eyebrow="Overview"
         title="Codex 使用概览"
         description="活跃趋势与最近记录。"
-        actions={
-          <>
-            <Button variant="secondary" onClick={refresh} icon={<Download className="h-4 w-4" />}>
-              刷新数据
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("json")} icon={<FileJson2 className="h-4 w-4" />}>
-              导出 JSON
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("markdown")} icon={<FileText className="h-4 w-4" />}>
-              导出 Markdown
-            </Button>
-          </>
-        }
+        actions={<DashboardHeaderActions baseName="dashboard" filters={filters} loading={loading} onRefresh={refresh} />}
       />
 
       <AnalyticsToolbar
@@ -152,8 +125,12 @@ export function DashboardPage() {
                     {summary.recentImports.map((item) => (
                       <tr key={item.id}>
                         <td>{item.sourceLabel}</td>
-                        <td>{item.status}</td>
-                        <td>{`${item.filesSuccess}/${item.filesTotal}`}</td>
+                        <td>
+                          <ImportStatusBadge status={item.status} />
+                        </td>
+                        <td>
+                          <ImportProgress item={item} compact />
+                        </td>
                         <td>{formatDateTime(item.finishedAt ?? item.startedAt)}</td>
                       </tr>
                     ))}

@@ -2,7 +2,9 @@ use crate::models::parser::{
     ParseContext, ParseResult, ParseWarning, ParsedMessage, ParsedRawEvent, ParserTarget,
     SessionIndexEntry,
 };
-use crate::parsers::{extract_text, finalize_session, SessionSeed, SourceParser};
+use crate::parsers::{
+    compact_json_string, extract_text, finalize_session, SessionSeed, SourceParser,
+};
 use serde_json::Value;
 use std::{
     collections::HashSet,
@@ -91,8 +93,7 @@ impl SourceParser for CodexSessionJsonlParser {
                 ts: timestamp.clone(),
                 outer_type: outer_type.clone(),
                 inner_type: inner_type.clone(),
-                payload_json: serde_json::to_string(&payload)
-                    .unwrap_or_else(|_| "null".to_string()),
+                payload_json: compact_codex_event_payload(&outer_type, &payload),
                 warning_code: None,
             });
 
@@ -205,6 +206,123 @@ fn ingest_session_meta(
     }
 }
 
+fn compact_codex_event_payload(outer_type: &str, payload: &Value) -> String {
+    let Some(payload_type) = payload.get("type").and_then(Value::as_str) else {
+        return compact_json_string(payload);
+    };
+
+    let mut compact = serde_json::Map::new();
+    insert_string(&mut compact, "type", Some(payload_type));
+    insert_string(
+        &mut compact,
+        "turn_id",
+        payload.get("turn_id").and_then(Value::as_str),
+    );
+
+    match (outer_type, payload_type) {
+        ("event_msg", "task_started") => {
+            insert_i64(
+                &mut compact,
+                "started_at",
+                payload.get("started_at").and_then(Value::as_i64),
+            );
+        }
+        ("turn_context", _) => {
+            insert_string(
+                &mut compact,
+                "model",
+                payload.get("model").and_then(Value::as_str),
+            );
+            insert_string(
+                &mut compact,
+                "effort",
+                payload.get("effort").and_then(Value::as_str),
+            );
+            insert_string(
+                &mut compact,
+                "cwd",
+                payload.get("cwd").and_then(Value::as_str),
+            );
+            if let Some(mode) = payload.get("collaboration_mode") {
+                compact.insert("collaboration_mode".to_string(), mode.clone());
+            }
+        }
+        ("event_msg", "user_message") => {
+            insert_string(
+                &mut compact,
+                "message",
+                payload.get("message").and_then(Value::as_str),
+            );
+        }
+        ("event_msg", "task_complete") => {
+            insert_i64(
+                &mut compact,
+                "completed_at",
+                payload.get("completed_at").and_then(Value::as_i64),
+            );
+            insert_i64(
+                &mut compact,
+                "duration_ms",
+                payload.get("duration_ms").and_then(Value::as_i64),
+            );
+        }
+        ("event_msg", "agent_reasoning")
+        | ("event_msg", "agent_message")
+        | ("event_msg", "turn_aborted")
+        | ("event_msg", "thread_rolled_back")
+        | ("event_msg", "context_compacted")
+        | ("compacted", _) => {}
+        ("event_msg", "token_count") | ("token_count", _) => {
+            if let Some(info) = payload.get("info") {
+                compact.insert("info".to_string(), info.clone());
+            }
+        }
+        ("response_item", "function_call")
+        | ("response_item", "custom_tool_call")
+        | ("response_item", "web_search_call") => {
+            insert_string(
+                &mut compact,
+                "name",
+                payload.get("name").and_then(Value::as_str),
+            );
+            insert_string(
+                &mut compact,
+                "call_id",
+                payload.get("call_id").and_then(Value::as_str),
+            );
+            if let Some(action) = payload.get("action") {
+                compact.insert("action".to_string(), action.clone());
+            }
+        }
+        ("response_item", "function_call_output")
+        | ("response_item", "custom_tool_call_output") => {
+            insert_string(
+                &mut compact,
+                "call_id",
+                payload.get("call_id").and_then(Value::as_str),
+            );
+            if let Some(output) = payload.get("output") {
+                compact.insert("output".to_string(), output.clone());
+            }
+        }
+        _ => {}
+    }
+
+    compact_json_string(&Value::Object(compact))
+}
+
+fn insert_string(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), Value::String(value.to_string()));
+    }
+}
+
+fn insert_i64(map: &mut serde_json::Map<String, Value>, key: &str, value: Option<i64>) {
+    if let Some(value) = value {
+        map.insert(key.to_string(), Value::Number(value.into()));
+    }
+}
+
 fn extract_codex_message(
     outer_type: &str,
     payload: &Value,
@@ -223,7 +341,7 @@ fn extract_codex_message(
                 ts: timestamp,
                 tool_name: None,
                 phase: None,
-                meta_json: serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+                meta_json: compact_json_string(payload),
             }),
             Some("agent_message") => Some(ParsedMessage {
                 turn_id: payload
@@ -239,7 +357,7 @@ fn extract_codex_message(
                     .get("phase")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
-                meta_json: serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+                meta_json: compact_json_string(payload),
             }),
             _ => None,
         },
@@ -262,7 +380,7 @@ fn extract_codex_message(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 phase: None,
-                meta_json: serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+                meta_json: compact_json_string(payload),
             }),
             Some("function_call_output") | Some("custom_tool_call_output") => Some(ParsedMessage {
                 turn_id: payload
@@ -281,7 +399,7 @@ fn extract_codex_message(
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 phase: None,
-                meta_json: serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+                meta_json: compact_json_string(payload),
             }),
             _ => None,
         },
@@ -314,7 +432,7 @@ fn extract_response_message(payload: &Value, timestamp: Option<String>) -> Optio
             .get("phase")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        meta_json: serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string()),
+        meta_json: compact_json_string(payload),
     })
 }
 

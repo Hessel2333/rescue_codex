@@ -1,16 +1,14 @@
 import type { EChartsOption } from "echarts";
-import { Download, FileJson2, FileText } from "lucide-react";
 import { useMemo } from "react";
 import { useTheme } from "../../app/theme";
-import { Button } from "../../components/Button";
-import { EChart } from "../../components/EChart";
+import { chartFontFamily, EChart } from "../../components/EChart";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { AnalyticsToolbar } from "../../features/dashboard/AnalyticsToolbar";
+import { DashboardHeaderActions } from "../../features/dashboard/DashboardHeaderActions";
 import { useDashboardControls } from "../../features/dashboard/dashboardControls";
 import { useDashboardSummary } from "../../features/dashboard/useDashboardSummary";
 import { formatDuration, formatNumber } from "../../lib/format";
-import { exportReport, pickSavePath } from "../../lib/tauri";
 import { ScatterDatum } from "../../types/api";
 
 type YMetric = "completionSec" | "totalTokens";
@@ -50,7 +48,7 @@ function buildEmptyGraphic(text: string, color: string) {
       style: {
         text,
         fill: color,
-        fontFamily: "IBM Plex Sans",
+        fontFamily: chartFontFamily,
         fontSize: 13,
         align: "center",
       },
@@ -208,20 +206,6 @@ export function CorrelationsPage() {
   const { summary, loading, error, refresh } = useDashboardSummary(filters, "correlations");
   const colors = useChartColors();
 
-  async function handleExport(format: "json" | "markdown") {
-    const path = await pickSavePath(`rescue_codex-correlations.${format === "markdown" ? "md" : format}`);
-    if (!path) {
-      return;
-    }
-
-    await exportReport({
-      kind: "dashboard",
-      format,
-      path,
-      dashboardFilters: filters,
-    });
-  }
-
   const availableFrom = summary?.scope.availableFrom;
   const availableTo = summary?.scope.availableTo;
   const currentScopeText = summary ? `${summary.scope.dateFrom} 至 ${summary.scope.dateTo}` : "载入中";
@@ -311,19 +295,7 @@ export function CorrelationsPage() {
         eyebrow="Correlations"
         title="相关性分析"
         description="每张图只保留一个 X 与一个 Y 的关系，专门用来观察线性趋势和离群点。"
-        actions={
-          <>
-            <Button variant="secondary" onClick={refresh} icon={<Download className="h-4 w-4" />}>
-              刷新数据
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("json")} icon={<FileJson2 className="h-4 w-4" />}>
-              导出 JSON
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("markdown")} icon={<FileText className="h-4 w-4" />}>
-              导出 Markdown
-            </Button>
-          </>
-        }
+        actions={<DashboardHeaderActions baseName="correlations" filters={filters} loading={loading} onRefresh={refresh} />}
       />
 
       <AnalyticsToolbar
@@ -344,7 +316,7 @@ export function CorrelationsPage() {
       {error ? <Panel title="载入失败">{error}</Panel> : null}
 
       {summary ? (
-        <div className="grid gap-6 2xl:grid-cols-2">
+        <div className="grid gap-6 xl:grid-cols-2">
           {charts.map((chart) => (
             <Panel key={chart.title} title={chart.title}>
               <EChart option={buildScatterOption(chart, colors)} height={320} />

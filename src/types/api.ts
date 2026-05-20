@@ -7,7 +7,16 @@ export type AppInfo = {
 
 export type DashboardRangePreset = "7d" | "30d" | "90d" | "365d" | "all" | "custom";
 export type DashboardGranularity = "day" | "week" | "month" | "year";
-export type DashboardSection = "overview" | "performance" | "workflow" | "search" | "projects" | "correlations" | "all";
+export type DashboardSection =
+  | "overview"
+  | "performance"
+  | "workflow"
+  | "search"
+  | "projects"
+  | "correlations"
+  | "imports"
+  | "settings"
+  | "all";
 
 export type DashboardFilters = {
   preset?: DashboardRangePreset;

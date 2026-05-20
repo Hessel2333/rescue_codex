@@ -1,17 +1,15 @@
 import type { EChartsOption } from "echarts";
-import { Download, FileJson2, FileText } from "lucide-react";
 import { useMemo } from "react";
 import { useTheme } from "../../app/theme";
-import { Button } from "../../components/Button";
 import { EChart } from "../../components/EChart";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { AnalyticsToolbar } from "../../features/dashboard/AnalyticsToolbar";
 import { PerformanceCharts } from "../../features/dashboard/ChartsPanel";
+import { DashboardHeaderActions } from "../../features/dashboard/DashboardHeaderActions";
 import { useDashboardControls } from "../../features/dashboard/dashboardControls";
 import { useDashboardSummary } from "../../features/dashboard/useDashboardSummary";
 import { formatDateTime, formatDuration, formatNumber, formatOptionalText } from "../../lib/format";
-import { exportReport, pickSavePath } from "../../lib/tauri";
 import { sanitizeMessagePreview } from "../../lib/sessionVisibility";
 import { RankedTurnRecord } from "../../types/api";
 
@@ -115,20 +113,6 @@ export function PerformancePage() {
   const { summary, loading, error, refresh } = useDashboardSummary(filters, "performance");
   const colors = useChartColors();
 
-  async function handleExport(format: "json" | "markdown") {
-    const path = await pickSavePath(`rescue_codex-performance.${format === "markdown" ? "md" : format}`);
-    if (!path) {
-      return;
-    }
-
-    await exportReport({
-      kind: "dashboard",
-      format,
-      path,
-      dashboardFilters: filters,
-    });
-  }
-
   const availableFrom = summary?.scope.availableFrom;
   const availableTo = summary?.scope.availableTo;
   const currentScopeText = summary ? `${summary.scope.dateFrom} 至 ${summary.scope.dateTo}` : "载入中";
@@ -143,19 +127,7 @@ export function PerformancePage() {
         eyebrow="Performance"
         title="等待与模型性能"
         description="聚焦响应速度、整轮完成耗时、工具成功率与平均耗时，以及模型、速度档位和推理强度的变化。"
-        actions={
-          <>
-            <Button variant="secondary" onClick={refresh} icon={<Download className="h-4 w-4" />}>
-              刷新数据
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("json")} icon={<FileJson2 className="h-4 w-4" />}>
-              导出 JSON
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("markdown")} icon={<FileText className="h-4 w-4" />}>
-              导出 Markdown
-            </Button>
-          </>
-        }
+        actions={<DashboardHeaderActions baseName="performance" filters={filters} loading={loading} onRefresh={refresh} />}
       />
 
       <AnalyticsToolbar
@@ -177,7 +149,7 @@ export function PerformancePage() {
 
       {summary ? (
         <>
-          <div className="grid gap-4 xl:grid-cols-5">
+          <div className="responsive-metric-grid">
             <Panel title="总 Tokens">
               <div className="metric-card__value">{formatNumber(summary.tokenUsage.totalTokens)}</div>
             </Panel>

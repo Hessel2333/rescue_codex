@@ -34,6 +34,9 @@ type EChartProps = {
   className?: string;
 };
 
+export const chartFontFamily =
+  '"IBM Plex Sans", "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Aptos", "Segoe UI Variable", "Segoe UI", sans-serif';
+
 export function EChart({ option, height = 300, className }: EChartProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<echarts.EChartsType | null>(null);
@@ -71,7 +74,16 @@ export function EChart({ option, height = 300, className }: EChartProps) {
   }, []);
 
   useEffect(() => {
-    chartRef.current?.setOption(option, true);
+    chartRef.current?.setOption(
+      {
+        ...option,
+        textStyle: {
+          fontFamily: chartFontFamily,
+          ...option.textStyle,
+        },
+      },
+      true,
+    );
   }, [option]);
 
   return <div ref={rootRef} className={clsx("w-full", className)} style={{ height }} />;

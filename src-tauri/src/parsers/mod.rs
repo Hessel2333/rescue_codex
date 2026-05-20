@@ -12,6 +12,8 @@ use crate::models::parser::{
     ParseContext, ParseResult, ParseWarning, ParsedMessage, ParsedSession, ParserTarget,
 };
 
+const MAX_JSON_STRING_CHARS: usize = 8_192;
+
 pub use codex_session_jsonl::CodexSessionJsonlParser;
 pub use generic_json::GenericJsonParser;
 pub use generic_jsonl::GenericJsonlParser;
@@ -258,8 +260,35 @@ pub fn generic_message_from_value(value: &Value, ts: Option<String>) -> Option<P
             .get("phase")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        meta_json: serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()),
+        meta_json: compact_json_string(value),
     })
+}
+
+pub fn compact_json_string(value: &Value) -> String {
+    let mut compacted = value.clone();
+    compact_value(&mut compacted);
+    serde_json::to_string(&compacted).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn compact_value(value: &mut Value) {
+    match value {
+        Value::String(text) if text.chars().count() > MAX_JSON_STRING_CHARS => {
+            let original_chars = text.chars().count();
+            let prefix = text.chars().take(MAX_JSON_STRING_CHARS).collect::<String>();
+            *text = format!("{prefix}\n[truncated {original_chars} chars]");
+        }
+        Value::Array(items) => {
+            for item in items {
+                compact_value(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                compact_value(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn iso_from_millis(value: i64) -> Option<String> {

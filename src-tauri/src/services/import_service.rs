@@ -6,8 +6,10 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{BufRead, BufReader, Read},
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
+    thread,
     time::UNIX_EPOCH,
 };
 use uuid::Uuid;
@@ -23,10 +25,44 @@ use crate::{
     state::AppState,
 };
 
+pub fn start_scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> {
+    if !state.try_start_import() {
+        anyhow::bail!("已有导入任务正在运行，请稍后再试");
+    }
+
+    let home_dir = dirs::home_dir().context("failed to resolve user home directory")?;
+    let codex_root = home_dir.join(".codex");
+    let worker_state = state.clone();
+
+    thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| scan_default_source(&worker_state)));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("background default import failed: {error:#}"),
+            Err(_) => eprintln!("background default import panicked"),
+        }
+        worker_state.finish_import();
+    });
+
+    Ok(ImportRunResult {
+        import_id: "background".to_string(),
+        source_label: "Default Codex Home".to_string(),
+        root_path: codex_root.to_string_lossy().into_owned(),
+        status: "running".to_string(),
+        files_total: 0,
+        files_success: 0,
+        files_failed: 0,
+        warnings_count: 0,
+        errors_count: 0,
+        issues: Vec::new(),
+    })
+}
+
 pub fn scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> {
     let home_dir = dirs::home_dir().context("failed to resolve user home directory")?;
     let codex_root = home_dir.join(".codex");
     let sessions_root = codex_root.join("sessions");
+    let archived_sessions_root = codex_root.join("archived_sessions");
     let session_index = load_session_index(&codex_root.join("session_index.jsonl"));
     let startup_warning = match (codex_root.exists(), sessions_root.exists()) {
         (false, _) => Some(ParseWarning {
@@ -46,7 +82,11 @@ pub fn scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> 
         _ => None,
     };
     let files = if sessions_root.exists() {
-        collect_supported_files(&[sessions_root.clone()])
+        let mut roots = vec![sessions_root];
+        if archived_sessions_root.exists() {
+            roots.push(archived_sessions_root);
+        }
+        collect_supported_files(&roots)
     } else {
         Vec::new()
     };
@@ -58,10 +98,49 @@ pub fn scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> 
         "codex_home",
         &source_label,
         "scan_default",
-        sessions_root,
+        codex_root,
         Arc::new(session_index),
         startup_warning,
     )
+}
+
+pub fn start_import_paths(
+    state: &AppState,
+    raw_paths: Vec<String>,
+) -> anyhow::Result<ImportRunResult> {
+    if raw_paths.is_empty() {
+        anyhow::bail!("no input paths provided");
+    }
+    if !state.try_start_import() {
+        anyhow::bail!("已有导入任务正在运行，请稍后再试");
+    }
+
+    let paths = raw_paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+    let root = common_root(&paths).unwrap_or_else(|| PathBuf::from("."));
+    let worker_state = state.clone();
+
+    thread::spawn(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| import_paths(&worker_state, raw_paths)));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("background manual import failed: {error:#}"),
+            Err(_) => eprintln!("background manual import panicked"),
+        }
+        worker_state.finish_import();
+    });
+
+    Ok(ImportRunResult {
+        import_id: "background".to_string(),
+        source_label: "Manual Import".to_string(),
+        root_path: root.to_string_lossy().into_owned(),
+        status: "running".to_string(),
+        files_total: 0,
+        files_success: 0,
+        files_failed: 0,
+        warnings_count: 0,
+        errors_count: 0,
+        issues: Vec::new(),
+    })
 }
 
 pub fn import_paths(state: &AppState, raw_paths: Vec<String>) -> anyhow::Result<ImportRunResult> {
@@ -110,6 +189,10 @@ fn run_import(
          VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
         params![import_id, source_id, mode, "auto", "registry-1", started_at],
     )?;
+    conn.execute(
+        "UPDATE imports SET files_total = ?2 WHERE id = ?1",
+        params![import_id, files.len() as i64],
+    )?;
 
     let mut files_success = 0_i64;
     let mut files_failed = 0_i64;
@@ -147,6 +230,14 @@ fn run_import(
                     &format!("无法读取文件元信息: {} ({error})", path.display()),
                     None,
                     None,
+                )?;
+                update_import_progress(
+                    &conn,
+                    &import_id,
+                    files_success,
+                    files_failed,
+                    warnings_count,
+                    errors_count,
                 )?;
                 continue;
             }
@@ -186,6 +277,14 @@ fn run_import(
                 &format!("文件为空，已跳过: {}", path.display()),
                 None,
                 None,
+            )?;
+            update_import_progress(
+                &conn,
+                &import_id,
+                files_success,
+                files_failed,
+                warnings_count,
+                errors_count,
             )?;
             continue;
         }
@@ -258,6 +357,15 @@ fn run_import(
                 )?;
             }
         }
+
+        update_import_progress(
+            &conn,
+            &import_id,
+            files_success,
+            files_failed,
+            warnings_count,
+            errors_count,
+        )?;
     }
 
     let status = if errors_count > 0 {
@@ -534,6 +642,29 @@ fn update_source_file_status(
     Ok(())
 }
 
+fn update_import_progress(
+    conn: &Connection,
+    import_id: &str,
+    files_success: i64,
+    files_failed: i64,
+    warnings_count: i64,
+    errors_count: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE imports
+         SET files_success = ?2, files_failed = ?3, warnings_count = ?4, errors_count = ?5
+         WHERE id = ?1",
+        params![
+            import_id,
+            files_success,
+            files_failed,
+            warnings_count,
+            errors_count
+        ],
+    )?;
+    Ok(())
+}
+
 fn insert_issue(
     conn: &Connection,
     import_id: &str,
@@ -595,11 +726,18 @@ fn load_import_issues(
     import_id: &str,
 ) -> anyhow::Result<Vec<ImportIssueRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT import_issues.id, severity, code, message, line_no, raw_excerpt, created_at, source_files.abs_path
+        "SELECT import_issues.id,
+                import_issues.severity,
+                import_issues.code,
+                import_issues.message,
+                import_issues.line_no,
+                import_issues.raw_excerpt,
+                import_issues.created_at,
+                source_files.abs_path
          FROM import_issues
          LEFT JOIN source_files ON source_files.id = import_issues.source_file_id
          WHERE import_id = ?1
-         ORDER BY created_at DESC
+         ORDER BY import_issues.created_at DESC
          LIMIT 20",
     )?;
     let rows = stmt.query_map(params![import_id], |row| {

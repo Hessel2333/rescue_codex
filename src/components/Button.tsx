@@ -9,6 +9,7 @@ type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
 export function Button({ className, variant = "primary", icon, children, ...props }: ButtonProps) {
   return (
     <button
+      type="button"
       className={clsx(
         "button-base",
         variant === "primary" && "button-primary",

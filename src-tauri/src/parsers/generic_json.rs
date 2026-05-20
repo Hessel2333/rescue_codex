@@ -2,7 +2,8 @@ use crate::models::parser::{
     ParseContext, ParseResult, ParseWarning, ParsedRawEvent, ParserTarget,
 };
 use crate::parsers::{
-    extract_text, finalize_session, generic_message_from_value, SessionSeed, SourceParser,
+    compact_json_string, extract_text, finalize_session, generic_message_from_value, SessionSeed,
+    SourceParser,
 };
 use serde_json::Value;
 use std::fs;
@@ -54,8 +55,7 @@ impl SourceParser for GenericJsonParser {
                             .unwrap_or("json_array_item")
                             .to_string(),
                         inner_type: None,
-                        payload_json: serde_json::to_string(item)
-                            .unwrap_or_else(|_| "null".to_string()),
+                        payload_json: compact_json_string(item),
                         warning_code: None,
                     });
                     if let Some(message) = generic_message_from_value(item, ts) {
@@ -81,8 +81,7 @@ impl SourceParser for GenericJsonParser {
                         .unwrap_or("json_object")
                         .to_string(),
                     inner_type: None,
-                    payload_json: serde_json::to_string(&value)
-                        .unwrap_or_else(|_| "null".to_string()),
+                    payload_json: compact_json_string(&value),
                     warning_code: None,
                 });
 
@@ -118,8 +117,7 @@ impl SourceParser for GenericJsonParser {
                         ts: events.first().and_then(|event| event.ts.clone()),
                         tool_name: None,
                         phase: None,
-                        meta_json: serde_json::to_string(&value)
-                            .unwrap_or_else(|_| "{}".to_string()),
+                        meta_json: compact_json_string(&value),
                     });
                 }
             }

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { ImportActions } from "../../features/imports/ImportActions";
+import { ImportProgress, ImportStatusBadge } from "../../features/imports/ImportProgress";
 import { getDashboardSummary, importPaths, pickFiles, pickFolders, scanDefaultSource } from "../../lib/tauri";
 import { formatDateTime } from "../../lib/format";
 import { DashboardSummary, ImportRunResult } from "../../types/api";
@@ -11,26 +12,43 @@ export function ImportsPage() {
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<ImportRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const latestImport = summary?.recentImports[0];
+  const importRunning = latestImport?.status === "running" || (!latestImport && result?.status === "running");
+  const activeImport = useMemo(() => {
+    if (latestImport?.status === "running") {
+      return latestImport;
+    }
+
+    return result?.status === "running" ? result : latestImport;
+  }, [latestImport, result]);
 
   async function load() {
     try {
-      const payload = await getDashboardSummary();
+      const payload = await getDashboardSummary({}, "imports");
       setSummary(payload);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法加载导入状态。");
     }
   }
 
-  async function run(task: () => Promise<ImportRunResult>) {
+  async function run(task: () => Promise<ImportRunResult | null>) {
     setBusy(true);
     setError(null);
+    setNotice("正在启动导入任务…");
 
     try {
       const payload = await task();
+      if (!payload) {
+        setNotice("已取消选择。");
+        return;
+      }
       setResult(payload);
+      setNotice(payload.status === "running" ? "后台导入已启动，进度会自动刷新。" : "导入任务已完成。");
       await load();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "导入失败。");
+      setNotice(null);
     } finally {
       setBusy(false);
     }
@@ -40,36 +58,71 @@ export function ImportsPage() {
     void load();
   }, []);
 
+  useEffect(() => {
+    if (!importRunning) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void load();
+    }, 2000);
+
+    return () => window.clearInterval(timer);
+  }, [importRunning]);
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
         eyebrow="Ingestion"
         title="本地扫描与导入"
-        description="默认扫描 `~/.codex/sessions`，也支持手动导入 JSON / JSONL 文件或目录。单文件异常不会中断整批导入。"
+        description="默认扫描 `~/.codex/sessions` 与归档会话，也支持手动导入 JSON / JSONL 文件或目录。导入会在后台执行。"
       />
 
       <Panel
         title="导入入口"
-        description="导入时会自动选择最合适的解析器，原始事件和归一化消息会一起写入 SQLite。"
+        description="导入时会自动选择最合适的解析器，进度会持续刷新，期间可以继续浏览其它页面。"
         actions={
           <ImportActions
-            busy={busy}
+            busy={busy || importRunning}
             onScanDefault={() => void run(() => scanDefaultSource())}
             onImportFiles={() =>
               void run(async () => {
                 const paths = await pickFiles();
+                if (paths.length === 0) {
+                  return null;
+                }
                 return importPaths(paths);
               })
             }
             onImportFolders={() =>
               void run(async () => {
                 const paths = await pickFolders();
+                if (paths.length === 0) {
+                  return null;
+                }
                 return importPaths(paths);
               })
             }
           />
         }
       >
+        {notice ? (
+          <div className="mb-4">
+            <p className="action-status action-status--left">{notice}</p>
+          </div>
+        ) : null}
+
+        {activeImport ? (
+          <div className="import-run-card mb-4">
+            <div className="min-w-0">
+              <p className="meta-label">当前导入任务</p>
+              <p className="section-title mt-2">{activeImport.sourceLabel}</p>
+              {"rootPath" in activeImport ? <p className="mono-value mt-1 text-xs">{activeImport.rootPath}</p> : null}
+            </div>
+            <ImportProgress item={activeImport} />
+          </div>
+        ) : null}
+
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <div className="surface-tile">
             <p className="meta-label">默认扫描根</p>
@@ -91,29 +144,8 @@ export function ImportsPage() {
       </Panel>
 
       {result ? (
-        <Panel title="最近一次执行" description="导入完成后，这里会展示本轮结果和问题摘要。">
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
-            <div className="surface-tile">
-              <p className="meta-label">状态</p>
-              <p className="section-title mt-2">{result.status}</p>
-            </div>
-            <div className="surface-tile">
-              <p className="meta-label">文件</p>
-              <p className="section-title mt-2">{`${result.filesSuccess}/${result.filesTotal}`}</p>
-            </div>
-            <div className="surface-tile">
-              <p className="meta-label">失败</p>
-              <p className="section-title mt-2">{result.filesFailed}</p>
-            </div>
-            <div className="surface-tile">
-              <p className="meta-label">Warnings</p>
-              <p className="section-title mt-2">{result.warningsCount}</p>
-            </div>
-            <div className="surface-tile">
-              <p className="meta-label">Errors</p>
-              <p className="section-title mt-2">{result.errorsCount}</p>
-            </div>
-          </div>
+        <Panel title="最近一次执行" description="后台任务启动后，导入历史会持续显示进度。">
+          <ImportProgress item={result} />
         </Panel>
       ) : null}
 
@@ -128,6 +160,7 @@ export function ImportsPage() {
                   <th>来源</th>
                   <th>模式</th>
                   <th>状态</th>
+                  <th>进度</th>
                   <th>开始时间</th>
                 </tr>
               </thead>
@@ -136,7 +169,12 @@ export function ImportsPage() {
                   <tr key={item.id}>
                     <td>{item.sourceLabel}</td>
                     <td>{item.mode}</td>
-                    <td>{item.status}</td>
+                    <td>
+                      <ImportStatusBadge status={item.status} />
+                    </td>
+                    <td>
+                      <ImportProgress item={item} compact />
+                    </td>
                     <td>{formatDateTime(item.startedAt)}</td>
                   </tr>
                 ))}

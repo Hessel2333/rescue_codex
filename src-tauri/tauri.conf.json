@@ -9,14 +9,24 @@
     "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist"
   },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
   "app": {
     "windows": [
       {
         "title": "rescue_codex",
         "width": 1520,
         "height": 980,
-        "minWidth": 1280,
-        "minHeight": 840,
+        "minWidth": 1100,
+        "minHeight": 760,
         "resizable": true
       }
     ],

@@ -11,7 +11,7 @@ use crate::{
 
 #[tauri::command]
 pub fn scan_default_source(state: State<'_, AppState>) -> Result<ImportRunResult, String> {
-    import_service::scan_default_source(&state).map_err(|error| error.to_string())
+    import_service::start_scan_default_source(&state).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -19,7 +19,7 @@ pub fn import_paths(
     state: State<'_, AppState>,
     paths: Vec<String>,
 ) -> Result<ImportRunResult, String> {
-    import_service::import_paths(&state, paths).map_err(|error| error.to_string())
+    import_service::start_import_paths(&state, paths).map_err(|error| error.to_string())
 }
 
 #[tauri::command]

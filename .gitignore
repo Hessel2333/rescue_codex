@@ -1,5 +1,9 @@
 node_modules/
 dist/
+.cargo/
+.rustup/
+native-macos/
+.DS_Store
 
 # Tauri / Rust build output
 src-tauri/target/

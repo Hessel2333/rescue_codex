@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Download, FileJson2, FileSpreadsheet, FileText } from "lucide-react";
+import { FileJson2, FileSpreadsheet, FileText, RefreshCw } from "lucide-react";
 import clsx from "clsx";
 import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
@@ -46,17 +46,28 @@ export function SessionsPage() {
   const [sourceDraft, setSourceDraft] = useState("");
   const [response, setResponse] = useState<SessionListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<"csv" | "json" | "markdown" | null>(null);
   const [loading, setLoading] = useState(true);
 
-  async function load(nextFilters: SessionListFilters) {
+  async function load(nextFilters: SessionListFilters, announce = true) {
     setLoading(true);
     setError(null);
+    if (announce) {
+      setActionMessage("正在重新载入会话列表…");
+    }
 
     try {
       const payload = await listSessions(nextFilters);
       setResponse(payload);
+      if (announce) {
+        setActionMessage("已重新载入会话列表。");
+      }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法加载会话。");
+      if (announce) {
+        setActionMessage(null);
+      }
     } finally {
       setLoading(false);
     }
@@ -86,19 +97,30 @@ export function SessionsPage() {
     const extension = format === "markdown" ? "md" : format;
     const path = await pickSavePath(`rescue_codex-sessions.${extension}`);
     if (!path) {
+      setActionMessage("已取消导出。");
       return;
     }
 
-    await exportReport({
-      kind: "sessions",
-      format,
-      path,
-      filters,
-    });
+    setExporting(format);
+    setActionMessage(`正在导出 ${format === "markdown" ? "Markdown" : format.toUpperCase()}…`);
+
+    try {
+      const result = await exportReport({
+        kind: "sessions",
+        format,
+        path,
+        filters,
+      });
+      setActionMessage(`已导出：${result.path}`);
+    } catch (cause) {
+      setActionMessage(cause instanceof Error ? `导出失败：${cause.message}` : "导出失败。");
+    } finally {
+      setExporting(null);
+    }
   }
 
   useEffect(() => {
-    void load(initialFilters);
+    void load(initialFilters, false);
   }, []);
 
   return (
@@ -108,20 +130,38 @@ export function SessionsPage() {
         title="会话列表与详情"
         description="支持按关键词、工作目录和来源筛选。"
         actions={
-          <>
-            <Button variant="secondary" onClick={() => void load(filters)} icon={<Download className="h-4 w-4" />}>
-              刷新
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("csv")} icon={<FileSpreadsheet className="h-4 w-4" />}>
-              导出 CSV
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("json")} icon={<FileJson2 className="h-4 w-4" />}>
-              导出 JSON
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("markdown")} icon={<FileText className="h-4 w-4" />}>
-              导出 Markdown
-            </Button>
-          </>
+          <div className="action-stack">
+            <div className="action-row">
+              <Button variant="secondary" disabled={loading} onClick={() => void load(filters)} icon={<RefreshCw className="h-4 w-4" />}>
+                {loading ? "重新载入中" : "重新载入"}
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("csv")}
+                icon={<FileSpreadsheet className="h-4 w-4" />}
+              >
+                {exporting === "csv" ? "导出中" : "导出 CSV"}
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("json")}
+                icon={<FileJson2 className="h-4 w-4" />}
+              >
+                {exporting === "json" ? "导出中" : "导出 JSON"}
+              </Button>
+              <Button
+                variant="secondary"
+                disabled={exporting !== null}
+                onClick={() => void handleExport("markdown")}
+                icon={<FileText className="h-4 w-4" />}
+              >
+                {exporting === "markdown" ? "导出中" : "导出 Markdown"}
+              </Button>
+            </div>
+            {actionMessage ? <p className="action-status">{actionMessage}</p> : null}
+          </div>
         }
       />
 

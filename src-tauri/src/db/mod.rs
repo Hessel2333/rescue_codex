@@ -20,6 +20,19 @@ pub fn database_path(app: &AppHandle) -> anyhow::Result<PathBuf> {
 pub fn init_database(path: &Path) -> anyhow::Result<()> {
     let conn = open_connection(path)?;
     conn.execute_batch(INITIAL_MIGRATION)?;
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_session_events_session_seq
+          ON session_events_raw(session_id, seq);
+        ",
+    )?;
+    let finished_at = now_iso();
+    conn.execute(
+        "UPDATE imports
+         SET status = 'interrupted', finished_at = ?1
+         WHERE status = 'running'",
+        [finished_at],
+    )?;
     Ok(())
 }
 

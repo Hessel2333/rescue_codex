@@ -1,15 +1,14 @@
 import type { EChartsOption } from "echarts";
-import { Download, FileJson2, FileText } from "lucide-react";
 import { useMemo } from "react";
 import { useTheme } from "../../app/theme";
-import { Button } from "../../components/Button";
-import { EChart } from "../../components/EChart";
+import { chartFontFamily, EChart } from "../../components/EChart";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { AnalyticsToolbar } from "../../features/dashboard/AnalyticsToolbar";
+import { DashboardHeaderActions } from "../../features/dashboard/DashboardHeaderActions";
+import { buildCategoryAxisLabel, categoryGridBottom, formatTimelineAxisLabel } from "../../features/dashboard/chartAxis";
 import { useDashboardControls } from "../../features/dashboard/dashboardControls";
 import { useDashboardSummary } from "../../features/dashboard/useDashboardSummary";
-import { exportReport, pickSavePath } from "../../lib/tauri";
 import { formatDateTime, formatDuration, formatNumber, formatOptionalText } from "../../lib/format";
 
 function useChartColors() {
@@ -42,7 +41,7 @@ function buildEmptyGraphic(text: string, color: string) {
       style: {
         text,
         fill: color,
-        fontFamily: "IBM Plex Sans",
+        fontFamily: chartFontFamily,
         fontSize: 13,
         align: "center",
       },
@@ -68,12 +67,12 @@ function buildProjectTimelineOption(summary: NonNullable<ReturnType<typeof useDa
       textStyle: { color: colors.tooltipText },
     },
     legend: { top: 0, textStyle: { color: colors.axis } },
-    grid: { left: 18, right: 18, top: 56, bottom: 24, containLabel: true },
+    grid: { left: 18, right: 18, top: 56, bottom: categoryGridBottom(buckets.length), containLabel: true },
     xAxis: {
       type: "category",
       data: buckets,
       axisLine: { lineStyle: { color: colors.grid } },
-      axisLabel: { color: colors.axis },
+      axisLabel: buildCategoryAxisLabel(colors.axis, buckets.length, formatTimelineAxisLabel),
     },
     yAxis: {
       type: "value",
@@ -142,20 +141,6 @@ export function ProjectsPage() {
   const { summary, loading, error, refresh } = useDashboardSummary(filters, "projects");
   const colors = useChartColors();
 
-  async function handleExport(format: "json" | "markdown") {
-    const path = await pickSavePath(`rescue_codex-projects.${format === "markdown" ? "md" : format}`);
-    if (!path) {
-      return;
-    }
-
-    await exportReport({
-      kind: "dashboard",
-      format,
-      path,
-      dashboardFilters: filters,
-    });
-  }
-
   const availableFrom = summary?.scope.availableFrom;
   const availableTo = summary?.scope.availableTo;
   const currentScopeText = summary ? `${summary.scope.dateFrom} 至 ${summary.scope.dateTo}` : "载入中";
@@ -170,19 +155,7 @@ export function ProjectsPage() {
         eyebrow="Projects"
         title="项目与窗口"
         description="单独观察不同项目的时间线、窗口数量、窗口消耗和并行开展情况。"
-        actions={
-          <>
-            <Button variant="secondary" onClick={refresh} icon={<Download className="h-4 w-4" />}>
-              刷新数据
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("json")} icon={<FileJson2 className="h-4 w-4" />}>
-              导出 JSON
-            </Button>
-            <Button variant="secondary" onClick={() => void handleExport("markdown")} icon={<FileText className="h-4 w-4" />}>
-              导出 Markdown
-            </Button>
-          </>
-        }
+        actions={<DashboardHeaderActions baseName="projects" filters={filters} loading={loading} onRefresh={refresh} />}
       />
 
       <AnalyticsToolbar

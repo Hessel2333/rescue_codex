@@ -1,10 +1,11 @@
 import type { EChartsOption } from "echarts";
 import { useMemo } from "react";
 import { useTheme } from "../../app/theme";
-import { EChart } from "../../components/EChart";
+import { chartFontFamily, EChart } from "../../components/EChart";
 import { Panel } from "../../components/Panel";
 import { formatDuration, formatNumber } from "../../lib/format";
 import { ActivityPoint, BreakdownDatum, ChartDatum, DashboardScope, ToolMetricDatum } from "../../types/api";
+import { buildCategoryAxisLabel, categoryGridBottom, formatTimelineAxisLabel } from "./chartAxis";
 import { GitHubHeatmap } from "./GitHubHeatmap";
 
 type OverviewChartsProps = {
@@ -75,7 +76,7 @@ function buildEmptyGraphic(text: string, axisColor: string) {
       style: {
         text,
         fill: axisColor,
-        fontFamily: "IBM Plex Sans",
+        fontFamily: chartFontFamily,
         fontSize: 13,
         align: "center",
       },
@@ -83,12 +84,12 @@ function buildEmptyGraphic(text: string, axisColor: string) {
   ] satisfies EChartsOption["graphic"];
 }
 
-function baseGrid(top = 16) {
+function baseGrid(top = 16, bottom = 24) {
   return {
     left: 18,
     right: 18,
     top,
-    bottom: 24,
+    bottom,
     containLabel: true,
   };
 }
@@ -100,7 +101,7 @@ function formatActivityAxisLabel(value: string, granularity: DashboardScope["gra
   if (granularity === "week") {
     return value.replace(/^Wk\s+/, "");
   }
-  return value;
+  return formatTimelineAxisLabel(value);
 }
 
 function buildActivityOption(
@@ -130,15 +131,14 @@ function buildActivityOption(
       top: 0,
       textStyle: { color: colors.axis },
     },
-    grid: baseGrid(56),
+    grid: baseGrid(56, categoryGridBottom(activity.length)),
     xAxis: {
       type: "category",
       boundaryGap: true,
       axisLine: { lineStyle: { color: colors.grid } },
-      axisLabel: {
-        color: colors.axis,
-        formatter: (value: string) => formatActivityAxisLabel(value, granularity),
-      },
+      axisLabel: buildCategoryAxisLabel(colors.axis, activity.length, (value: string) =>
+        formatActivityAxisLabel(value, granularity),
+      ),
       data: activity.map((item) => item.date),
     },
     yAxis: [
@@ -209,10 +209,10 @@ function buildVerticalBarOption(
         return `${item?.axisValueLabel ?? ""}<br/>${item?.marker ?? ""}${valueFormatter ? valueFormatter(value) : formatNumber(value)}`;
       },
     },
-    grid: baseGrid(),
+    grid: baseGrid(16, categoryGridBottom(data.length)),
     xAxis: {
       type: "category",
-      axisLabel: { color: colors.axis, interval: 0 },
+      axisLabel: buildCategoryAxisLabel(colors.axis, data.length),
       axisLine: { lineStyle: { color: colors.grid } },
       data: data.map((item) => item.label),
     },
@@ -317,7 +317,7 @@ function buildPieOption(data: ChartDatum[], title: string, colors: ReturnType<ty
               style: {
                 text: title,
                 fill: colors.tooltipText,
-                fontFamily: "IBM Plex Sans",
+                fontFamily: chartFontFamily,
                 fontSize: 13,
                 fontWeight: 600,
                 align: "center",
@@ -363,10 +363,10 @@ function buildBreakdownOption(
       top: 0,
       textStyle: { color: colors.axis },
     },
-    grid: baseGrid(52),
+    grid: baseGrid(52, categoryGridBottom(buckets.length)),
     xAxis: {
       type: "category",
-      axisLabel: { color: colors.axis, interval: 0 },
+      axisLabel: buildCategoryAxisLabel(colors.axis, buckets.length, formatTimelineAxisLabel),
       axisLine: { lineStyle: { color: colors.grid } },
       data: buckets,
     },
@@ -486,7 +486,7 @@ export function PerformanceCharts({
   const colors = useChartColors();
 
   return (
-    <div className="grid gap-6 2xl:grid-cols-2">
+    <div className="grid gap-6 xl:grid-cols-2">
       <Panel title="首 Token 耗时分布">
         <EChart option={buildVerticalBarOption(firstTokenBuckets, colors.accentC, colors, (value) => formatDuration(value))} height={300} />
       </Panel>
@@ -552,7 +552,7 @@ export function WorkflowCharts({
   const colors = useChartColors();
 
   return (
-    <div className="grid gap-6 2xl:grid-cols-2">
+    <div className="grid gap-6 xl:grid-cols-2">
       <Panel title="提问时间分布">
         <EChart option={buildVerticalBarOption(questionHours, colors.accentA, colors)} height={300} />
       </Panel>
@@ -585,7 +585,7 @@ export function WorkflowCharts({
         <EChart option={buildVerticalBarOption(workspaceSwitches, colors.accentF, colors)} height={300} />
       </Panel>
 
-      <Panel title="工作区切换时间线" className="2xl:col-span-2">
+      <Panel title="工作区切换时间线" className="xl:col-span-2">
         <EChart option={buildBreakdownOption(workspaceTimeline, colors, [colors.accentF, colors.accentE])} height={320} />
       </Panel>
     </div>
@@ -596,7 +596,7 @@ export function SearchCharts({ searchKeywords, searchHours }: SearchChartsProps)
   const colors = useChartColors();
 
   return (
-    <div className="grid gap-6 2xl:grid-cols-2">
+    <div className="grid gap-6 xl:grid-cols-2">
       <Panel title="搜索时间分布">
         <EChart option={buildVerticalBarOption(searchHours, colors.accentC, colors)} height={300} />
       </Panel>

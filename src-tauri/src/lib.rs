@@ -16,6 +16,10 @@ pub fn run() {
             let db_path = db::database_path(app.handle())?;
             db::init_database(&db_path)?;
             app.manage(AppState::new(db_path));
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

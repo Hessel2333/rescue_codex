@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { NavLink, Outlet } from "react-router-dom";
-import { useTheme } from "../theme";
+import { type ThemeMode, useTheme } from "../theme";
 
 const navItems = [
   { to: "/dashboard", label: "概览", icon: LayoutDashboard },
@@ -32,6 +32,31 @@ const themeOptions = [
   { value: "system", label: "系统" },
 ] as const;
 
+function SidebarThemeSwitcher({ mode, setMode }: { mode: ThemeMode; setMode: (mode: ThemeMode) => void }) {
+  return (
+    <section className="sidebar__theme" aria-label="外观设置">
+      <div className="sidebar__theme-header">
+        <SunMoon className="h-4 w-4" />
+        <span>外观</span>
+      </div>
+      <div className="sidebar__theme-group">
+        {themeOptions.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            className={clsx("sidebar__theme-button", {
+              "is-active": mode === option.value,
+            })}
+            onClick={() => setMode(option.value)}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export function AppShell() {
   const { mode, setMode } = useTheme();
 
@@ -40,7 +65,7 @@ export function AppShell() {
       <div className="app-shell__backdrop" />
       <div className="app-shell__inner">
         <aside className="sidebar">
-          <div>
+          <div className="sidebar__brand">
             <p className="sidebar__eyebrow">Local First Analytics</p>
             <h1 className="sidebar__title">rescue_codex</h1>
           </div>
@@ -63,26 +88,7 @@ export function AppShell() {
           </nav>
 
           <div className="sidebar__footer">
-            <div className="sidebar__theme">
-              <div className="flex items-center gap-2">
-                <SunMoon className="h-4 w-4" />
-                <span>外观</span>
-              </div>
-              <div className="sidebar__theme-group">
-                {themeOptions.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={clsx("sidebar__theme-button", {
-                      "is-active": mode === option.value,
-                    })}
-                    onClick={() => setMode(option.value)}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            </div>
+            <SidebarThemeSwitcher mode={mode} setMode={setMode} />
           </div>
         </aside>
 

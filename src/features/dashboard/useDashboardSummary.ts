@@ -4,7 +4,6 @@ import { DashboardFilters, DashboardSection, DashboardSummary } from "../../type
 
 const cache = new Map<string, DashboardSummary>();
 const inflight = new Map<string, Promise<DashboardSummary>>();
-const allSections: DashboardSection[] = ["overview", "performance", "workflow", "search", "projects", "correlations"];
 
 function normalizeFilters(filters: DashboardFilters) {
   return {
@@ -39,22 +38,6 @@ async function loadSummary(section: DashboardSection, filters: DashboardFilters)
   return request;
 }
 
-function prefetchSections(currentSection: DashboardSection, filters: DashboardFilters) {
-  if (currentSection === "all") {
-    return;
-  }
-
-  for (const section of allSections) {
-    if (section === currentSection) {
-      continue;
-    }
-    const key = buildCacheKey(section, filters);
-    if (!cache.has(key) && !inflight.has(key)) {
-      void loadSummary(section, filters);
-    }
-  }
-}
-
 export function useDashboardSummary(filters: DashboardFilters, section: DashboardSection) {
   const cacheKey = useMemo(() => buildCacheKey(section, filters), [filters, section]);
   const [summary, setSummary] = useState<DashboardSummary | null>(() => cache.get(cacheKey) ?? null);
@@ -69,7 +52,6 @@ export function useDashboardSummary(filters: DashboardFilters, section: Dashboar
       setSummary(cached);
       setLoading(false);
       setError(null);
-      prefetchSections(section, filters);
       return () => {
         cancelled = true;
       };
@@ -83,7 +65,6 @@ export function useDashboardSummary(filters: DashboardFilters, section: Dashboar
         if (!cancelled) {
           setSummary(payload);
           setLoading(false);
-          prefetchSections(section, filters);
         }
       })
       .catch((cause) => {

@@ -92,6 +92,8 @@ enum SummarySection {
     Search,
     Projects,
     Correlations,
+    Imports,
+    Settings,
 }
 
 impl SummarySection {
@@ -103,6 +105,8 @@ impl SummarySection {
             "search" => Self::Search,
             "projects" => Self::Projects,
             "correlations" => Self::Correlations,
+            "imports" => Self::Imports,
+            "settings" => Self::Settings,
             _ => Self::All,
         }
     }
@@ -129,6 +133,14 @@ impl SummarySection {
 
     fn includes_correlations(self) -> bool {
         matches!(self, Self::All | Self::Correlations)
+    }
+
+    fn includes_imports(self) -> bool {
+        matches!(self, Self::All | Self::Overview | Self::Imports)
+    }
+
+    fn is_lightweight(self) -> bool {
+        matches!(self, Self::Imports | Self::Settings)
     }
 }
 
@@ -161,6 +173,18 @@ impl ResolvedDashboardScope {
                 .map(|value| value.format("%Y-%m-%d").to_string()),
             total_days: (self.end - self.start).num_days() + 1,
         }
+    }
+}
+
+fn default_dashboard_scope(granularity: Option<&str>) -> ResolvedDashboardScope {
+    let today = Local::now().date_naive();
+    ResolvedDashboardScope {
+        preset: RangePreset::All,
+        granularity: TimeGranularity::from_filter(granularity),
+        start: today,
+        end: today,
+        available_start: None,
+        available_end: None,
     }
 }
 
@@ -361,14 +385,26 @@ pub(crate) fn load_dashboard_summary(
     section: Option<String>,
 ) -> anyhow::Result<DashboardSummary> {
     let section = SummarySection::from_filter(section.as_deref());
-    let scope = resolve_dashboard_scope(conn, &filters)?;
+    let scope = if section.is_lightweight() {
+        default_dashboard_scope(filters.granularity.as_deref())
+    } else {
+        resolve_dashboard_scope(conn, &filters)?
+    };
     let selected_project = normalize_project_filter(filters.project.as_deref());
-    let session_snapshots = load_session_snapshots(conn, &scope, selected_project.as_deref())?;
+    let session_snapshots = if section.is_lightweight() {
+        Vec::new()
+    } else {
+        load_session_snapshots(conn, &scope, selected_project.as_deref())?
+    };
     let mut summary = DashboardSummary {
         scope: scope.to_api(),
         app_info: build_app_info(state),
         account_info: build_account_info(),
-        project_options: load_project_options(conn)?,
+        project_options: if section.is_lightweight() {
+            Vec::new()
+        } else {
+            load_project_options(conn)?
+        },
         selected_project: filters
             .project
             .clone()
@@ -426,8 +462,11 @@ pub(crate) fn load_dashboard_summary(
             top_metrics_from_sessions(&session_snapshots, |item| item.cwd.clone(), 6);
         summary.top_sources =
             top_metrics_from_sessions(&session_snapshots, |item| item.source.clone(), 6);
-        summary.recent_imports = load_recent_imports(conn)?;
         summary.recent_sessions = recent_sessions_from_snapshots(&session_snapshots, 8);
+    }
+
+    if section.includes_imports() {
+        summary.recent_imports = load_recent_imports(conn)?;
         summary.recent_issues = load_recent_issues(conn)?;
     }
 
@@ -2036,21 +2075,30 @@ fn build_turn_analytics(
     selected_project: Option<&str>,
     sessions: &[SessionSnapshot],
 ) -> anyhow::Result<TurnAnalytics> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, seq, ts, outer_type, inner_type, payload_json
-         FROM session_events_raw
-         ORDER BY session_id, seq",
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.session_id, e.seq, e.ts, e.outer_type, e.inner_type, e.payload_json
+             FROM session_events_raw e
+             JOIN sessions s ON s.id = e.session_id
+             WHERE {SESSION_DATE_SQL} >= ?1
+               AND {SESSION_DATE_SQL} <= ?2
+             ORDER BY e.session_id, e.seq"
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            scope.start.format("%Y-%m-%d").to_string(),
+            scope.end.format("%Y-%m-%d").to_string()
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        },
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, String>(5)?,
-        ))
-    })?;
 
     let mut current_session_id = String::new();
     let mut current_turn_id: Option<String> = None;
