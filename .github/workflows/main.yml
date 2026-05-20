@@ -19,7 +19,7 @@ jobs:
             args: "--target aarch64-apple-darwin --bundles dmg"
           - platform: macos-latest
             args: "--target x86_64-apple-darwin --bundles dmg"
-          - platform: windows-latest
+          - platform: windows-2025
             args: "--bundles nsis"
 
     runs-on: ${{ matrix.platform }}
@@ -46,7 +46,7 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
