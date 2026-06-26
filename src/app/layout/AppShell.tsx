@@ -13,6 +13,7 @@ import {
 import clsx from "clsx";
 import { NavLink, Outlet } from "react-router-dom";
 import { type ThemeMode, useTheme } from "../theme";
+import { useAutoImportSync } from "../../features/imports/autoSync";
 
 const navItems = [
   { to: "/dashboard", label: "概览", icon: LayoutDashboard },
@@ -59,6 +60,7 @@ function SidebarThemeSwitcher({ mode, setMode }: { mode: ThemeMode; setMode: (mo
 
 export function AppShell() {
   const { mode, setMode } = useTheme();
+  useAutoImportSync();
 
   return (
     <div className="app-shell">

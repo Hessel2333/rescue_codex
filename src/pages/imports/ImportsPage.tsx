@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { ImportActions } from "../../features/imports/ImportActions";
@@ -6,6 +6,7 @@ import { ImportProgress, ImportStatusBadge } from "../../features/imports/Import
 import { getDashboardSummary, importPaths, pickFiles, pickFolders, scanDefaultSource } from "../../lib/tauri";
 import { formatDateTime } from "../../lib/format";
 import { DashboardSummary, ImportRunResult } from "../../types/api";
+import { importDataRefreshEvent, notifyImportDataRefresh } from "../../features/imports/importEvents";
 
 export function ImportsPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
@@ -23,14 +24,14 @@ export function ImportsPage() {
     return result?.status === "running" ? result : latestImport;
   }, [latestImport, result]);
 
-  async function load() {
+  const load = useCallback(async () => {
     try {
       const payload = await getDashboardSummary({}, "imports");
       setSummary(payload);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "无法加载导入状态。");
     }
-  }
+  }, []);
 
   async function run(task: () => Promise<ImportRunResult | null>) {
     setBusy(true);
@@ -46,6 +47,7 @@ export function ImportsPage() {
       setResult(payload);
       setNotice(payload.status === "running" ? "后台导入已启动，进度会自动刷新。" : "导入任务已完成。");
       await load();
+      notifyImportDataRefresh();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "导入失败。");
       setNotice(null);
@@ -56,7 +58,16 @@ export function ImportsPage() {
 
   useEffect(() => {
     void load();
-  }, []);
+  }, [load]);
+
+  useEffect(() => {
+    const refresh = () => {
+      void load();
+    };
+
+    window.addEventListener(importDataRefreshEvent, refresh);
+    return () => window.removeEventListener(importDataRefreshEvent, refresh);
+  }, [load]);
 
   useEffect(() => {
     if (!importRunning) {

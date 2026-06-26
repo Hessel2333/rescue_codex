@@ -3,10 +3,16 @@ import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { getDashboardSummary } from "../../lib/tauri";
 import { DashboardSummary } from "../../types/api";
+import {
+  autoImportIntervalOptions,
+  readAutoImportSyncSettings,
+  saveAutoImportSyncSettings,
+} from "../../features/imports/autoSync";
 
 export function SettingsPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [autoImport, setAutoImport] = useState(readAutoImportSyncSettings);
 
   useEffect(() => {
     getDashboardSummary({}, "settings")
@@ -16,15 +22,66 @@ export function SettingsPage() {
       });
   }, []);
 
+  function updateAutoImport(next: typeof autoImport) {
+    setAutoImport(next);
+    saveAutoImportSyncSettings(next);
+  }
+
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
         eyebrow="Settings"
         title="应用设置与运行信息"
-        description="查看本地数据路径与运行能力。后续可继续扩展默认扫描目录、导出偏好和实验功能开关。"
+        description="管理本地数据更新、存储位置和应用能力。"
       />
 
       {error ? <Panel title="读取失败">{error}</Panel> : null}
+
+      <Panel title="自动更新" description="打开应用后自动同步 Codex 会话，并按设定频率在后台刷新。">
+        <div className="grid gap-4 md:grid-cols-2">
+          <label className="surface-tile flex cursor-pointer items-start gap-3">
+            <input
+              type="checkbox"
+              className="mt-1 h-4 w-4"
+              checked={autoImport.enabled}
+              onChange={(event) =>
+                updateAutoImport({
+                  ...autoImport,
+                  enabled: event.currentTarget.checked,
+                })
+              }
+            />
+            <span>
+              <span className="meta-label block">自动扫描</span>
+              <span className="body-text mt-2 block">{autoImport.enabled ? "已开启" : "已关闭"}</span>
+            </span>
+          </label>
+
+          <div className="surface-tile">
+            <label className="meta-label" htmlFor="auto-import-interval">
+              刷新频率
+            </label>
+            <select
+              id="auto-import-interval"
+              className="settings-select mt-3"
+              value={autoImport.intervalMinutes}
+              disabled={!autoImport.enabled}
+              onChange={(event) =>
+                updateAutoImport({
+                  ...autoImport,
+                  intervalMinutes: Number(event.currentTarget.value),
+                })
+              }
+            >
+              {autoImportIntervalOptions.map((minutes) => (
+                <option key={minutes} value={minutes}>
+                  每 {minutes} 分钟
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </Panel>
 
       <Panel title="本地路径" description="所有数据都在本地读取和存储，不依赖逆向私有 API。">
         <div className="stack-list">

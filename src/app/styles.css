@@ -932,6 +932,26 @@ textarea {
   outline-offset: 2px;
 }
 
+.settings-select {
+  width: 100%;
+  min-height: 2.5rem;
+  border: 1px solid var(--rc-border);
+  border-radius: 0.75rem;
+  background: var(--rc-surface-muted);
+  color: var(--rc-text);
+  padding: 0 0.85rem;
+  outline: none;
+}
+
+.settings-select:disabled {
+  opacity: 0.55;
+}
+
+.settings-select:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--rc-accent-alt) 42%, transparent);
+  outline-offset: 2px;
+}
+
 .dashboard-toolbar__navigator {
   display: flex;
   align-items: center;

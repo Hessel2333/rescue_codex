@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getDashboardSummary } from "../../lib/tauri";
 import { DashboardFilters, DashboardSection, DashboardSummary } from "../../types/api";
+import { importDataRefreshEvent } from "../imports/importEvents";
 
 const cache = new Map<string, DashboardSummary>();
 const inflight = new Map<string, Promise<DashboardSummary>>();
@@ -78,6 +79,17 @@ export function useDashboardSummary(filters: DashboardFilters, section: Dashboar
       cancelled = true;
     };
   }, [cacheKey, filters, refreshKey, section]);
+
+  useEffect(() => {
+    const refreshAll = () => {
+      cache.clear();
+      inflight.clear();
+      setRefreshKey((value) => value + 1);
+    };
+
+    window.addEventListener(importDataRefreshEvent, refreshAll);
+    return () => window.removeEventListener(importDataRefreshEvent, refreshAll);
+  }, []);
 
   return {
     summary,
