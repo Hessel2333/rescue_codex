@@ -12,7 +12,12 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+
             let db_path = db::database_path(app.handle())?;
             db::init_database(&db_path)?;
             app.manage(AppState::new(db_path));

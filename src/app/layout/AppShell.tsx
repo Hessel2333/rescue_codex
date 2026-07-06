@@ -14,6 +14,7 @@ import clsx from "clsx";
 import { NavLink, Outlet } from "react-router-dom";
 import { type ThemeMode, useTheme } from "../theme";
 import { useAutoImportSync } from "../../features/imports/autoSync";
+import { AppUpdateManager } from "../../features/updates/AppUpdateManager";
 
 const navItems = [
   { to: "/dashboard", label: "概览", icon: LayoutDashboard },
@@ -98,6 +99,7 @@ export function AppShell() {
           <Outlet />
         </main>
       </div>
+      <AppUpdateManager />
     </div>
   );
 }
