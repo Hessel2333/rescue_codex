@@ -858,7 +858,11 @@ fn hash_file(path: &Path) -> anyhow::Result<String> {
         hasher.update(&buffer[..bytes]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn load_session_index(path: &Path) -> HashMap<String, SessionIndexEntry> {

@@ -302,7 +302,11 @@ pub fn short_hash(seed: &str) -> String {
 pub fn message_hash(text: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(normalize_text(text));
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub fn normalize_text(text: &str) -> String {
