@@ -9,8 +9,18 @@ import { Button } from "../../components/Button";
 const INITIAL_CHECK_DELAY_MS = 2500;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const UPDATE_TIMEOUT_MS = 30000;
+const COMPLETED_UPDATE_STORAGE_KEY = "rescue-codex-completed-update";
+const LAST_SEEN_VERSION_STORAGE_KEY = "rescue-codex-last-seen-version";
 
 type UpdateStatus = "available" | "downloading" | "ready" | "error";
+
+type CompletedUpdate = {
+  fromVersion: string;
+  toVersion: string;
+  body?: string;
+  date?: string;
+  completedAt: string;
+};
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -34,10 +44,42 @@ function formatPercent(downloaded: number, total: number) {
   return `${Math.min(100, Math.round((downloaded / total) * 100))}%`;
 }
 
+function readCompletedUpdate() {
+  try {
+    const raw = window.localStorage.getItem(COMPLETED_UPDATE_STORAGE_KEY);
+
+    if (!raw) {
+      return null;
+    }
+
+    return JSON.parse(raw) as CompletedUpdate;
+  } catch {
+    window.localStorage.removeItem(COMPLETED_UPDATE_STORAGE_KEY);
+    return null;
+  }
+}
+
+function storeCompletedUpdate(update: Update, currentVersion: string | null) {
+  const completedUpdate: CompletedUpdate = {
+    fromVersion: currentVersion ?? update.currentVersion,
+    toVersion: update.version,
+    body: update.body,
+    date: update.date,
+    completedAt: new Date().toISOString(),
+  };
+
+  window.localStorage.setItem(COMPLETED_UPDATE_STORAGE_KEY, JSON.stringify(completedUpdate));
+}
+
+function markVersionAsSeen(version: string) {
+  window.localStorage.setItem(LAST_SEEN_VERSION_STORAGE_KEY, version);
+}
+
 export function AppUpdateManager() {
   const [visible, setVisible] = useState(false);
   const [status, setStatus] = useState<UpdateStatus>("available");
   const [update, setUpdate] = useState<Update | null>(null);
+  const [completedUpdate, setCompletedUpdate] = useState<CompletedUpdate | null>(null);
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [contentLength, setContentLength] = useState(0);
@@ -45,7 +87,7 @@ export function AppUpdateManager() {
   const checkingRef = useRef(false);
 
   const checkForUpdates = useCallback(async () => {
-    if (!isTauriRuntime() || checkingRef.current) {
+    if (!isTauriRuntime() || checkingRef.current || completedUpdate) {
       return;
     }
 
@@ -73,6 +115,40 @@ export function AppUpdateManager() {
     } finally {
       checkingRef.current = false;
     }
+  }, [completedUpdate]);
+
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    void getVersion()
+      .then((localVersion) => {
+        const completed = readCompletedUpdate();
+
+        if (completed && localVersion === completed.toVersion) {
+          setCompletedUpdate(completed);
+          setVisible(true);
+          return;
+        }
+
+        const lastSeenVersion = window.localStorage.getItem(LAST_SEEN_VERSION_STORAGE_KEY);
+
+        if (lastSeenVersion && lastSeenVersion !== localVersion) {
+          setCompletedUpdate({
+            fromVersion: lastSeenVersion,
+            toVersion: localVersion,
+            completedAt: new Date().toISOString(),
+          });
+          setVisible(true);
+          return;
+        }
+
+        markVersionAsSeen(localVersion);
+      })
+      .catch(() => {
+        window.localStorage.removeItem(COMPLETED_UPDATE_STORAGE_KEY);
+      });
   }, []);
 
   useEffect(() => {
@@ -118,6 +194,7 @@ export function AppUpdateManager() {
         }
       });
 
+      storeCompletedUpdate(update, currentVersion);
       setStatus("ready");
     } catch (error) {
       console.warn("Failed to install update", error);
@@ -130,35 +207,52 @@ export function AppUpdateManager() {
     await relaunch();
   };
 
-  if (!visible || !update) {
+  const closeCompletedUpdate = () => {
+    if (completedUpdate) {
+      markVersionAsSeen(completedUpdate.toVersion);
+    }
+    window.localStorage.removeItem(COMPLETED_UPDATE_STORAGE_KEY);
+    setCompletedUpdate(null);
+    setVisible(false);
+  };
+
+  if (!visible || (!update && !completedUpdate)) {
     return null;
   }
 
+  const activeVersion = completedUpdate?.toVersion ?? update?.version ?? "";
+  const notes = normalizeNotes(completedUpdate?.body ?? update?.body);
   const percent = contentLength > 0 ? Math.min(100, Math.round((downloadedBytes / contentLength) * 100)) : 0;
   const progressStyle = { "--update-progress": `${percent}%` } as CSSProperties;
-  const notes = normalizeNotes(update.body);
   const isDownloading = status === "downloading";
   const canClose = !isDownloading;
+  const isCompleted = Boolean(completedUpdate);
 
   return (
     <div className="update-modal" role="dialog" aria-modal="true" aria-labelledby="update-modal-title">
       <div className="update-modal__card">
         <header className="update-modal__header">
-          <div className="update-modal__icon" aria-hidden="true">
+          <div className={isCompleted ? "update-modal__icon update-modal__icon--success" : "update-modal__icon"} aria-hidden="true">
             <Sparkles className="h-6 w-6" />
           </div>
           <div>
-            <h2 id="update-modal-title">发现新版本</h2>
-            <p>
-              当前版本 v{currentVersion ?? update.currentVersion}，新版本 v{update.version} 已可用。
-            </p>
+            <h2 id="update-modal-title">{isCompleted ? "🎉 更新成功！" : "发现新版本"}</h2>
+            {completedUpdate ? (
+              <p>
+                已从 v{completedUpdate.fromVersion} 更新到 v{completedUpdate.toVersion}
+              </p>
+            ) : (
+              <p>
+                当前版本 v{currentVersion ?? update?.currentVersion}，新版本 v{activeVersion} 已可用。
+              </p>
+            )}
           </div>
           <button
             type="button"
             className="update-modal__close"
-            aria-label="稍后再说"
+            aria-label={isCompleted ? "关闭" : "稍后再说"}
             disabled={!canClose}
-            onClick={() => setVisible(false)}
+            onClick={isCompleted ? closeCompletedUpdate : () => setVisible(false)}
           >
             <X className="h-5 w-5" />
           </button>
@@ -166,16 +260,18 @@ export function AppUpdateManager() {
 
         <section className="update-modal__body">
           <div className="update-modal__version-row">
-            <span>v{update.version}</span>
-            {update.date ? <time>{new Date(update.date).toLocaleDateString()}</time> : null}
+            <span>v{activeVersion}</span>
+            {(completedUpdate?.date ?? update?.date) ? <time>{new Date(completedUpdate?.date ?? update?.date ?? "").toLocaleDateString()}</time> : null}
           </div>
 
-          <div className="update-progress" style={progressStyle}>
-            <div className="update-progress__track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
-              <span className={isDownloading && contentLength === 0 ? "is-indeterminate" : ""} />
+          {isCompleted ? null : (
+            <div className="update-progress" style={progressStyle}>
+              <div className="update-progress__track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+                <span className={isDownloading && contentLength === 0 ? "is-indeterminate" : ""} />
+              </div>
+              <p>{isDownloading ? `下载中... ${formatPercent(downloadedBytes, contentLength)}` : status === "ready" ? "更新已安装，重启后生效。" : "准备好后即可下载并安装。"}</p>
             </div>
-            <p>{isDownloading ? `下载中… ${formatPercent(downloadedBytes, contentLength)}` : status === "ready" ? "更新已安装，重启后生效。" : "准备好后即可下载并安装。"}</p>
-          </div>
+          )}
 
           <div className="update-modal__notes">
             <h3>更新内容</h3>
@@ -190,7 +286,11 @@ export function AppUpdateManager() {
         </section>
 
         <footer className="update-modal__footer">
-          {status !== "ready" ? (
+          {isCompleted ? (
+            <Button icon={<Sparkles className="h-4 w-4" />} onClick={closeCompletedUpdate}>
+              我知道了
+            </Button>
+          ) : status !== "ready" ? (
             <>
               <Button variant="secondary" disabled={!canClose} onClick={() => setVisible(false)}>
                 稍后

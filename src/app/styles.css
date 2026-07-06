@@ -876,6 +876,11 @@ textarea {
   box-shadow: var(--shadow-soft);
 }
 
+.update-modal__icon--success {
+  background:
+    linear-gradient(135deg, color-mix(in srgb, #2563eb 84%, #111827), color-mix(in srgb, #0ea5e9 76%, #10b981));
+}
+
 .update-modal__header h2 {
   margin: 0;
   color: var(--rc-text-strong);
