@@ -5,6 +5,7 @@ import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updat
 import { relaunch } from "@tauri-apps/plugin-process";
 import { Check, RefreshCw, Sparkles, X } from "lucide-react";
 import { Button } from "../../components/Button";
+import { dispatchUpdateCheckResult, requestUpdateCheckEvent } from "./updateEvents";
 
 const INITIAL_CHECK_DELAY_MS = 2500;
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
@@ -13,6 +14,10 @@ const COMPLETED_UPDATE_STORAGE_KEY = "rescue-codex-completed-update";
 const LAST_SEEN_VERSION_STORAGE_KEY = "rescue-codex-last-seen-version";
 
 type UpdateStatus = "available" | "downloading" | "ready" | "error";
+
+type CheckForUpdatesOptions = {
+  manual?: boolean;
+};
 
 type CompletedUpdate = {
   fromVersion: string;
@@ -86,20 +91,44 @@ export function AppUpdateManager() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const checkingRef = useRef(false);
 
-  const checkForUpdates = useCallback(async () => {
-    if (!isTauriRuntime() || checkingRef.current || completedUpdate) {
+  const checkForUpdates = useCallback(async (options: CheckForUpdatesOptions = {}) => {
+    if (!isTauriRuntime()) {
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "error" });
+      }
+      return;
+    }
+
+    if (completedUpdate) {
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "latest" });
+      }
+      return;
+    }
+
+    if (checkingRef.current) {
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "checking" });
+      }
       return;
     }
 
     checkingRef.current = true;
 
     try {
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "checking" });
+      }
+
       const [foundUpdate, localVersion] = await Promise.all([
         check({ timeout: UPDATE_TIMEOUT_MS }),
         getVersion().catch(() => null),
       ]);
 
       if (!foundUpdate) {
+        if (options.manual) {
+          dispatchUpdateCheckResult({ status: "latest" });
+        }
         return;
       }
 
@@ -110,7 +139,13 @@ export function AppUpdateManager() {
       setDownloadedBytes(0);
       setContentLength(0);
       setVisible(true);
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "available", version: foundUpdate.version });
+      }
     } catch {
+      if (options.manual) {
+        dispatchUpdateCheckResult({ status: "error" });
+      }
       // Silent background checks should not interrupt normal use.
     } finally {
       checkingRef.current = false;
@@ -159,6 +194,15 @@ export function AppUpdateManager() {
       window.clearTimeout(initialCheck);
       window.clearInterval(interval);
     };
+  }, [checkForUpdates]);
+
+  useEffect(() => {
+    const handleManualCheck = () => {
+      void checkForUpdates({ manual: true });
+    };
+
+    window.addEventListener(requestUpdateCheckEvent, handleManualCheck);
+    return () => window.removeEventListener(requestUpdateCheckEvent, handleManualCheck);
   }, [checkForUpdates]);
 
   const installUpdate = async () => {

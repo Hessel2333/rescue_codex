@@ -1,4 +1,7 @@
 import { useEffect, useState } from "react";
+import { getVersion } from "@tauri-apps/api/app";
+import { RefreshCw } from "lucide-react";
+import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
 import { Panel } from "../../components/Panel";
 import { getDashboardSummary } from "../../lib/tauri";
@@ -8,11 +11,20 @@ import {
   readAutoImportSyncSettings,
   saveAutoImportSyncSettings,
 } from "../../features/imports/autoSync";
+import { requestUpdateCheck, updateCheckResultEvent, type UpdateCheckResult } from "../../features/updates/updateEvents";
+
+type ManualUpdateStatus = "idle" | UpdateCheckResult["status"];
+
+function isTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
 
 export function SettingsPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoImport, setAutoImport] = useState(readAutoImportSyncSettings);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
+  const [manualUpdateStatus, setManualUpdateStatus] = useState<ManualUpdateStatus>("idle");
 
   useEffect(() => {
     getDashboardSummary({}, "settings")
@@ -22,10 +34,46 @@ export function SettingsPage() {
       });
   }, []);
 
+  useEffect(() => {
+    if (!isTauriRuntime()) {
+      return;
+    }
+
+    void getVersion().then(setAppVersion).catch(() => setAppVersion(null));
+  }, []);
+
+  useEffect(() => {
+    const syncUpdateStatus = (event: Event) => {
+      const detail = (event as CustomEvent<UpdateCheckResult>).detail;
+      setManualUpdateStatus(detail.status);
+    };
+
+    window.addEventListener(updateCheckResultEvent, syncUpdateStatus);
+    return () => window.removeEventListener(updateCheckResultEvent, syncUpdateStatus);
+  }, []);
+
   function updateAutoImport(next: typeof autoImport) {
     setAutoImport(next);
     saveAutoImportSyncSettings(next);
   }
+
+  function checkForUpdates() {
+    setManualUpdateStatus("checking");
+    requestUpdateCheck();
+  }
+
+  const updateStatusText =
+    manualUpdateStatus === "checking"
+      ? "正在检查更新..."
+      : manualUpdateStatus === "latest"
+        ? "当前已是最新版本。"
+        : manualUpdateStatus === "available"
+          ? "发现新版本，已打开更新窗口。"
+          : manualUpdateStatus === "error"
+            ? "检查失败，请稍后重试。"
+            : appVersion
+              ? `当前版本 v${appVersion}`
+              : "可随时手动检查应用更新。";
 
   return (
     <div className="flex flex-col gap-6">
@@ -36,6 +84,23 @@ export function SettingsPage() {
       />
 
       {error ? <Panel title="读取失败">{error}</Panel> : null}
+
+      <Panel title="应用更新" description="手动检查应用安装包更新。">
+        <div className="surface-tile flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="meta-label">版本更新</p>
+            <p className="body-text mt-2">{updateStatusText}</p>
+          </div>
+          <Button
+            variant="secondary"
+            icon={<RefreshCw className={manualUpdateStatus === "checking" ? "h-4 w-4 animate-spin" : "h-4 w-4"} />}
+            disabled={manualUpdateStatus === "checking"}
+            onClick={checkForUpdates}
+          >
+            检查更新
+          </Button>
+        </div>
+      </Panel>
 
       <Panel title="自动更新" description="打开应用后自动同步 Codex 会话，并按设定频率在后台刷新。">
         <div className="grid gap-4 md:grid-cols-2">
