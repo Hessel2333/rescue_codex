@@ -84,7 +84,6 @@ export function ImportsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Ingestion"
         title="本地扫描与导入"
         description="默认扫描 `~/.codex/sessions` 与归档会话，也支持手动导入 JSON / JSONL 文件或目录。导入会在后台执行。"
       />

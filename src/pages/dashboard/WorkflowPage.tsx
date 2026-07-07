@@ -31,7 +31,6 @@ export function WorkflowPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Workflow"
         title="提问与工作流"
         description="观察你如何提问、什么时候提问、是否频繁切换项目或工作区，以及交互中断和连接异常的走势。"
         actions={<DashboardHeaderActions baseName="workflow" filters={filters} loading={loading} onRefresh={refresh} />}

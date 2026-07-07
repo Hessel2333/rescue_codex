@@ -1,4 +1,4 @@
-import { FileJson2, FileText, RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "../../components/Button";
 import { exportReport, pickSavePath } from "../../lib/tauri";
@@ -21,6 +21,7 @@ function exportLabel(format: ExportFormat) {
 
 export function DashboardHeaderActions({ baseName, filters, loading, onRefresh }: DashboardHeaderActionsProps) {
   const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  const [selectedExport, setSelectedExport] = useState<Extract<ExportFormat, "json" | "markdown">>("json");
   const [message, setMessage] = useState<string | null>(null);
   const refreshRequested = useRef(false);
 
@@ -70,21 +71,25 @@ export function DashboardHeaderActions({ baseName, filters, loading, onRefresh }
         <Button variant="secondary" onClick={handleRefresh} disabled={loading} icon={<RefreshCw className="h-4 w-4" />}>
           {loading && refreshRequested.current ? "重新载入中" : "重新载入"}
         </Button>
+        <label className="action-select-label">
+          <span>导出格式</span>
+          <select
+            className="action-select"
+            value={selectedExport}
+            disabled={exporting !== null}
+            onChange={(event) => setSelectedExport(event.currentTarget.value as Extract<ExportFormat, "json" | "markdown">)}
+          >
+            <option value="json">JSON</option>
+            <option value="markdown">Markdown</option>
+          </select>
+        </label>
         <Button
           variant="secondary"
-          onClick={() => void handleExport("json")}
+          onClick={() => void handleExport(selectedExport)}
           disabled={exporting !== null}
-          icon={<FileJson2 className="h-4 w-4" />}
+          icon={<Download className="h-4 w-4" />}
         >
-          {exporting === "json" ? "导出中" : "导出 JSON"}
-        </Button>
-        <Button
-          variant="secondary"
-          onClick={() => void handleExport("markdown")}
-          disabled={exporting !== null}
-          icon={<FileText className="h-4 w-4" />}
-        >
-          {exporting === "markdown" ? "导出中" : "导出 Markdown"}
+          {exporting ? "导出中" : "导出"}
         </Button>
       </div>
       {message ? <p className="action-status">{message}</p> : null}

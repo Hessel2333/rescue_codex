@@ -124,7 +124,6 @@ export function PerformancePage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Performance"
         title="等待与模型性能"
         description="聚焦响应速度、整轮完成耗时、工具成功率与平均耗时，以及模型、速度档位和推理强度的变化。"
         actions={<DashboardHeaderActions baseName="performance" filters={filters} loading={loading} onRefresh={refresh} />}

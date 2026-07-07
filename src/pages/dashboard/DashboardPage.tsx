@@ -44,7 +44,6 @@ export function DashboardPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Overview"
         title="Codex 使用概览"
         description="活跃趋势与最近记录。"
         actions={<DashboardHeaderActions baseName="dashboard" filters={filters} loading={loading} onRefresh={refresh} />}

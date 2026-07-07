@@ -78,7 +78,6 @@ export function SettingsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Settings"
         title="应用设置与运行信息"
         description="管理本地数据更新、存储位置和应用能力。"
       />

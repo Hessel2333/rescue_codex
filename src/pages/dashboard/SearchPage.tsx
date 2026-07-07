@@ -31,7 +31,6 @@ export function SearchPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Search"
         title="搜索行为"
         description="单独观察 Web Search 的关键词、使用时段，以及你在什么时间更依赖外部检索。"
         actions={<DashboardHeaderActions baseName="search" filters={filters} loading={loading} onRefresh={refresh} />}

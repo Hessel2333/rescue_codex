@@ -152,7 +152,6 @@ export function ProjectsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Projects"
         title="项目与窗口"
         description="单独观察不同项目的时间线、窗口数量、窗口消耗和并行开展情况。"
         actions={<DashboardHeaderActions baseName="projects" filters={filters} loading={loading} onRefresh={refresh} />}

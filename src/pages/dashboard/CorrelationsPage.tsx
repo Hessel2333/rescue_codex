@@ -292,7 +292,6 @@ export function CorrelationsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Correlations"
         title="相关性分析"
         description="每张图只保留一个 X 与一个 Y 的关系，专门用来观察线性趋势和离群点。"
         actions={<DashboardHeaderActions baseName="correlations" filters={filters} loading={loading} onRefresh={refresh} />}

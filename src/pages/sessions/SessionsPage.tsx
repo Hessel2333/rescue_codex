@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { FileJson2, FileSpreadsheet, FileText, RefreshCw } from "lucide-react";
+import { Download, RefreshCw } from "lucide-react";
 import clsx from "clsx";
 import { Button } from "../../components/Button";
 import { PageHeader } from "../../components/PageHeader";
@@ -44,6 +44,7 @@ export function SessionsPage() {
   const [queryDraft, setQueryDraft] = useState("");
   const [cwdDraft, setCwdDraft] = useState("");
   const [sourceDraft, setSourceDraft] = useState("");
+  const [exportFormat, setExportFormat] = useState<"csv" | "json" | "markdown">("csv");
   const [response, setResponse] = useState<SessionListResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [actionMessage, setActionMessage] = useState<string | null>(null);
@@ -126,7 +127,6 @@ export function SessionsPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader
-        eyebrow="Sessions"
         title="会话列表与详情"
         description="支持按关键词、工作目录和来源筛选。"
         actions={
@@ -135,29 +135,26 @@ export function SessionsPage() {
               <Button variant="secondary" disabled={loading} onClick={() => void load(filters)} icon={<RefreshCw className="h-4 w-4" />}>
                 {loading ? "重新载入中" : "重新载入"}
               </Button>
+              <label className="action-select-label">
+                <span>导出格式</span>
+                <select
+                  className="action-select"
+                  value={exportFormat}
+                  disabled={exporting !== null}
+                  onChange={(event) => setExportFormat(event.currentTarget.value as "csv" | "json" | "markdown")}
+                >
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON</option>
+                  <option value="markdown">Markdown</option>
+                </select>
+              </label>
               <Button
                 variant="secondary"
                 disabled={exporting !== null}
-                onClick={() => void handleExport("csv")}
-                icon={<FileSpreadsheet className="h-4 w-4" />}
+                onClick={() => void handleExport(exportFormat)}
+                icon={<Download className="h-4 w-4" />}
               >
-                {exporting === "csv" ? "导出中" : "导出 CSV"}
-              </Button>
-              <Button
-                variant="secondary"
-                disabled={exporting !== null}
-                onClick={() => void handleExport("json")}
-                icon={<FileJson2 className="h-4 w-4" />}
-              >
-                {exporting === "json" ? "导出中" : "导出 JSON"}
-              </Button>
-              <Button
-                variant="secondary"
-                disabled={exporting !== null}
-                onClick={() => void handleExport("markdown")}
-                icon={<FileText className="h-4 w-4" />}
-              >
-                {exporting === "markdown" ? "导出中" : "导出 Markdown"}
+                {exporting ? "导出中" : "导出"}
               </Button>
             </div>
             {actionMessage ? <p className="action-status">{actionMessage}</p> : null}
@@ -166,38 +163,53 @@ export function SessionsPage() {
       />
 
       <Panel title="筛选器">
-        <div className="grid gap-4 lg:grid-cols-5">
-          <input
-            value={queryDraft}
-            onChange={(event) => setQueryDraft(event.target.value)}
-            placeholder="关键词 / 标题 / 首条消息"
-            className="field-input"
-          />
-          <input
-            value={cwdDraft}
-            onChange={(event) => setCwdDraft(event.target.value)}
-            placeholder="cwd 包含"
-            className="field-input"
-          />
-          <input
-            value={sourceDraft}
-            onChange={(event) => setSourceDraft(event.target.value)}
-            placeholder="source 包含"
-            className="field-input"
-          />
-          <input
-            type="date"
-            value={filters.dateFrom ?? ""}
-            onChange={(event) => setFilters((current) => ({ ...current, dateFrom: event.target.value || undefined }))}
-            className="field-input"
-          />
-          <div className="flex gap-3">
+        <div className="grid gap-4 lg:grid-cols-6">
+          <label className="field-group">
+            <span>关键词</span>
+            <input
+              value={queryDraft}
+              onChange={(event) => setQueryDraft(event.target.value)}
+              placeholder="标题或首条消息"
+              className="field-input"
+            />
+          </label>
+          <label className="field-group">
+            <span>工作目录</span>
+            <input
+              value={cwdDraft}
+              onChange={(event) => setCwdDraft(event.target.value)}
+              placeholder="路径包含"
+              className="field-input"
+            />
+          </label>
+          <label className="field-group">
+            <span>来源</span>
+            <input
+              value={sourceDraft}
+              onChange={(event) => setSourceDraft(event.target.value)}
+              placeholder="来源包含"
+              className="field-input"
+            />
+          </label>
+          <label className="field-group">
+            <span>开始日期</span>
             <input
               type="date"
-              value={filters.dateTo ?? ""}
-              onChange={(event) => setFilters((current) => ({ ...current, dateTo: event.target.value || undefined }))}
-              className="field-input min-w-0 flex-1"
+              value={filters.dateFrom ?? ""}
+              onChange={(event) => setFilters((current) => ({ ...current, dateFrom: event.target.value || undefined }))}
+              className="field-input"
             />
+          </label>
+          <div className="flex items-end gap-3 lg:col-span-2">
+            <label className="field-group min-w-0 flex-1">
+              <span>结束日期</span>
+              <input
+                type="date"
+                value={filters.dateTo ?? ""}
+                onChange={(event) => setFilters((current) => ({ ...current, dateTo: event.target.value || undefined }))}
+                className="field-input"
+              />
+            </label>
             <Button onClick={() => void applyFilters()}>应用</Button>
           </div>
         </div>

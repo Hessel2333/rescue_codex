@@ -26,7 +26,12 @@ function ToolbarButton({
   onClick: () => void;
 }) {
   return (
-    <button type="button" onClick={onClick} className={active ? "toolbar-chip is-active" : "toolbar-chip"}>
+    <button
+      type="button"
+      onClick={onClick}
+      className={active ? "toolbar-chip is-active" : "toolbar-chip"}
+      aria-pressed={active}
+    >
       {children}
     </button>
   );
@@ -76,6 +81,7 @@ export function AnalyticsToolbar({
             className="dashboard-toolbar__icon"
             onClick={() => setAnchorDate((current) => shiftAnchor(current, timeUnit, -1))}
             disabled={previousDisabled}
+            aria-label="上一时间段"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
@@ -89,6 +95,7 @@ export function AnalyticsToolbar({
             className="dashboard-toolbar__icon"
             onClick={() => setAnchorDate((current) => shiftAnchor(current, timeUnit, 1))}
             disabled={nextDisabled}
+            aria-label="下一时间段"
           >
             <ChevronRight className="h-4 w-4" />
           </button>
