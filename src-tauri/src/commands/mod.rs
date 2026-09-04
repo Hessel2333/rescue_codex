@@ -41,6 +41,11 @@ pub fn list_sessions(
 }
 
 #[tauri::command]
+pub fn load_session_media(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    query_service::load_session_media(&state, &id).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn export_report(
     state: State<'_, AppState>,
     request: ExportRequest,

@@ -66,6 +66,7 @@ function buildRankingOption(
           `首答耗时: ${formatDuration(item.firstResponseSec ?? 0)}`,
           `输入 / 输出: ${formatNumber(item.inputTokens)} / ${formatNumber(item.outputTokens)}`,
           `缓存输入: ${formatNumber(item.cachedInputTokens)}`,
+          `缓存写入: ${formatNumber(item.cacheWriteInputTokens)}`,
           `推理输出: ${formatNumber(item.reasoningOutputTokens)}`,
           `时间: ${formatDateTime(item.timestamp)}`,
         ].join("<br/>");
@@ -160,6 +161,9 @@ export function PerformancePage() {
             </Panel>
             <Panel title="缓存输入">
               <div className="metric-card__value">{formatNumber(summary.tokenUsage.cachedInputTokens)}</div>
+            </Panel>
+            <Panel title="缓存写入">
+              <div className="metric-card__value">{formatNumber(summary.tokenUsage.cacheWriteInputTokens)}</div>
             </Panel>
             <Panel title="推理输出">
               <div className="metric-card__value">{formatNumber(summary.tokenUsage.reasoningOutputTokens)}</div>

@@ -27,6 +27,10 @@ export async function listSessions(filters: SessionListFilters = {}) {
   return invoke<SessionListResponse>("list_sessions", { filters });
 }
 
+export async function loadSessionMedia(id: string) {
+  return invoke<string>("load_session_media", { id });
+}
+
 export async function exportReport(request: ExportRequest) {
   return invoke<ExportResult>("export_report", { request });
 }

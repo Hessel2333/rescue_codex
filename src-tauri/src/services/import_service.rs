@@ -1,9 +1,10 @@
 use anyhow::Context;
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, Read},
     panic::{catch_unwind, AssertUnwindSafe},
@@ -24,6 +25,18 @@ use crate::{
     parsers::{message_hash, ParserRegistry},
     state::AppState,
 };
+
+const PARSER_REGISTRY_VERSION: &str = "registry-3";
+
+struct ImportPlan {
+    files: Vec<PathBuf>,
+    source_kind: &'static str,
+    source_label: String,
+    mode: &'static str,
+    root_path: PathBuf,
+    session_index: Arc<HashMap<String, SessionIndexEntry>>,
+    startup_warning: Option<ParseWarning>,
+}
 
 pub fn start_scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> {
     if !state.try_start_import() {
@@ -91,16 +104,17 @@ pub fn scan_default_source(state: &AppState) -> anyhow::Result<ImportRunResult> 
         Vec::new()
     };
 
-    let source_label = "Default Codex Home".to_string();
     run_import(
         state,
-        files,
-        "codex_home",
-        &source_label,
-        "scan_default",
-        codex_root,
-        Arc::new(session_index),
-        startup_warning,
+        ImportPlan {
+            files,
+            source_kind: "codex_home",
+            source_label: "Default Codex Home".to_string(),
+            mode: "scan_default",
+            root_path: codex_root,
+            session_index: Arc::new(session_index),
+            startup_warning,
+        },
     )
 }
 
@@ -159,35 +173,44 @@ pub fn import_paths(state: &AppState, raw_paths: Vec<String>) -> anyhow::Result<
 
     run_import(
         state,
-        files,
-        "manual_import",
-        "Manual Import",
-        "manual_import",
-        root,
-        Arc::new(session_index),
-        None,
+        ImportPlan {
+            files,
+            source_kind: "manual_import",
+            source_label: "Manual Import".to_string(),
+            mode: "manual_import",
+            root_path: root,
+            session_index: Arc::new(session_index),
+            startup_warning: None,
+        },
     )
 }
 
-fn run_import(
-    state: &AppState,
-    files: Vec<PathBuf>,
-    source_kind: &str,
-    source_label: &str,
-    mode: &str,
-    root_path: PathBuf,
-    session_index: Arc<HashMap<String, SessionIndexEntry>>,
-    startup_warning: Option<ParseWarning>,
-) -> anyhow::Result<ImportRunResult> {
+fn run_import(state: &AppState, plan: ImportPlan) -> anyhow::Result<ImportRunResult> {
+    let ImportPlan {
+        files,
+        source_kind,
+        source_label,
+        mode,
+        root_path,
+        session_index,
+        startup_warning,
+    } = plan;
     let mut conn = open_connection(state.db_path())?;
-    let source_id = get_or_create_source(&conn, source_kind, source_label, &root_path)?;
+    let source_id = get_or_create_source(&conn, source_kind, &source_label, &root_path)?;
     let import_id = Uuid::new_v4().to_string();
     let started_at = now_iso();
 
     conn.execute(
         "INSERT INTO imports (id, source_id, mode, parser_key, parser_version, status, started_at)
          VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
-        params![import_id, source_id, mode, "auto", "registry-1", started_at],
+        params![
+            import_id,
+            source_id,
+            mode,
+            "auto",
+            PARSER_REGISTRY_VERSION,
+            started_at
+        ],
     )?;
     conn.execute(
         "UPDATE imports SET files_total = ?2 WHERE id = ?1",
@@ -204,12 +227,14 @@ fn run_import(
         insert_issue(
             &conn,
             &import_id,
-            None,
-            &warning.severity,
-            &warning.code,
-            &warning.message,
-            warning.line_no,
-            warning.raw_excerpt.as_deref(),
+            ImportIssueInput {
+                source_file_id: None,
+                severity: &warning.severity,
+                code: &warning.code,
+                message: &warning.message,
+                line_no: warning.line_no,
+                raw_excerpt: warning.raw_excerpt.as_deref(),
+            },
         )?;
     }
 
@@ -224,12 +249,14 @@ fn run_import(
                 insert_issue(
                     &conn,
                     &import_id,
-                    None,
-                    "error",
-                    "file_metadata_failed",
-                    &format!("无法读取文件元信息: {} ({error})", path.display()),
-                    None,
-                    None,
+                    ImportIssueInput {
+                        source_file_id: None,
+                        severity: "error",
+                        code: "file_metadata_failed",
+                        message: &format!("无法读取文件元信息: {} ({error})", path.display()),
+                        line_no: None,
+                        raw_excerpt: None,
+                    },
                 )?;
                 update_import_progress(
                     &conn,
@@ -251,17 +278,33 @@ fn run_import(
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or_default();
         let rel_path = path.strip_prefix(&root_path).ok().map(Path::to_path_buf);
+        if mtime_ms > 0
+            && source_file_is_current(&conn, path, size_bytes, mtime_ms, PARSER_REGISTRY_VERSION)?
+        {
+            files_success += 1;
+            update_import_progress(
+                &conn,
+                &import_id,
+                files_success,
+                files_failed,
+                warnings_count,
+                errors_count,
+            )?;
+            continue;
+        }
         let sha256 = hash_file(path)?;
         let source_file_id = ensure_source_file(
             &conn,
-            &source_id,
-            &import_id,
-            path,
-            rel_path.as_deref(),
-            size_bytes,
-            mtime_ms,
-            &sha256,
-            "processing",
+            SourceFileInput {
+                source_id: &source_id,
+                import_id: &import_id,
+                abs_path: path,
+                rel_path: rel_path.as_deref(),
+                size_bytes,
+                mtime_ms,
+                sha256: &sha256,
+                status: "processing",
+            },
         )?;
 
         if size_bytes == 0 {
@@ -271,12 +314,14 @@ fn run_import(
             insert_issue(
                 &conn,
                 &import_id,
-                Some(&source_file_id),
-                "warning",
-                "empty_file",
-                &format!("文件为空，已跳过: {}", path.display()),
-                None,
-                None,
+                ImportIssueInput {
+                    source_file_id: Some(&source_file_id),
+                    severity: "warning",
+                    code: "empty_file",
+                    message: &format!("文件为空，已跳过: {}", path.display()),
+                    line_no: None,
+                    raw_excerpt: None,
+                },
             )?;
             update_import_progress(
                 &conn,
@@ -291,7 +336,6 @@ fn run_import(
 
         let target = ParserTarget {
             abs_path: path.clone(),
-            rel_path: rel_path.clone(),
             extension: path
                 .extension()
                 .and_then(|ext| ext.to_str())
@@ -302,11 +346,7 @@ fn run_import(
 
         let parser = registry.resolve(&target)?;
         let ctx = ParseContext {
-            source_id: source_id.clone(),
-            import_id: import_id.clone(),
             abs_path: path.clone(),
-            rel_path: rel_path.clone(),
-            file_size: size_bytes as u64,
             mtime_ms,
             fingerprint: sha256,
             session_index: Arc::clone(&session_index),
@@ -321,6 +361,7 @@ fn run_import(
                         &source_file_id,
                         session.id.as_str(),
                         &result,
+                        state.media_dir(),
                     )?;
                     update_source_file_status(&conn, &source_file_id, &import_id, "imported")?;
                     files_success += 1;
@@ -332,12 +373,14 @@ fn run_import(
                     insert_issue(
                         &conn,
                         &import_id,
-                        Some(&source_file_id),
-                        "warning",
-                        "missing_session",
-                        &format!("解析结果未产生可用会话: {}", path.display()),
-                        None,
-                        None,
+                        ImportIssueInput {
+                            source_file_id: Some(&source_file_id),
+                            severity: "warning",
+                            code: "missing_session",
+                            message: &format!("解析结果未产生可用会话: {}", path.display()),
+                            line_no: None,
+                            raw_excerpt: None,
+                        },
                     )?;
                 }
             }
@@ -348,12 +391,14 @@ fn run_import(
                 insert_issue(
                     &conn,
                     &import_id,
-                    Some(&source_file_id),
-                    "error",
-                    "parse_failed",
-                    &format!("解析失败: {} ({error})", path.display()),
-                    None,
-                    None,
+                    ImportIssueInput {
+                        source_file_id: Some(&source_file_id),
+                        severity: "error",
+                        code: "parse_failed",
+                        message: &format!("解析失败: {} ({error})", path.display()),
+                        line_no: None,
+                        raw_excerpt: None,
+                    },
                 )?;
             }
         }
@@ -365,6 +410,22 @@ fn run_import(
             files_failed,
             warnings_count,
             errors_count,
+        )?;
+    }
+
+    if let Err(error) = prune_unreferenced_media(&conn, state.media_dir()) {
+        warnings_count += 1;
+        insert_issue(
+            &conn,
+            &import_id,
+            ImportIssueInput {
+                source_file_id: None,
+                severity: "warning",
+                code: "media_cache_cleanup_failed",
+                message: &format!("媒体缓存清理失败: {error}"),
+                line_no: None,
+                raw_excerpt: None,
+            },
         )?;
     }
 
@@ -397,7 +458,7 @@ fn run_import(
     let issues = load_import_issues(&conn, &import_id)?;
     Ok(ImportRunResult {
         import_id,
-        source_label: source_label.to_string(),
+        source_label,
         root_path: root_path.to_string_lossy().into_owned(),
         status: status.to_string(),
         files_total: files.len() as i64,
@@ -415,6 +476,7 @@ fn persist_result(
     source_file_id: &str,
     session_id: &str,
     result: &crate::models::parser::ParseResult,
+    media_dir: &Path,
 ) -> anyhow::Result<()> {
     let session = result
         .session
@@ -499,11 +561,13 @@ fn persist_result(
     }
 
     for message in &result.messages {
+        let message_id = Uuid::new_v4().to_string();
+        let meta_json = attach_cached_media(&message.meta_json, &message.media, media_dir);
         tx.execute(
             "INSERT INTO session_messages (id, session_id, turn_id, role, kind, text, ts, tool_name, phase, meta_json, text_hash)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                Uuid::new_v4().to_string(),
+                message_id,
                 session.id,
                 message.turn_id,
                 message.role,
@@ -512,7 +576,7 @@ fn persist_result(
                 message.ts,
                 message.tool_name,
                 message.phase,
-                message.meta_json,
+                meta_json,
                 message_hash(message.text.as_deref().unwrap_or_default())
             ],
         )?;
@@ -522,17 +586,229 @@ fn persist_result(
         insert_issue_tx(
             &tx,
             import_id,
-            Some(source_file_id),
-            &warning.severity,
-            &warning.code,
-            &warning.message,
-            warning.line_no,
-            warning.raw_excerpt.as_deref(),
+            ImportIssueInput {
+                source_file_id: Some(source_file_id),
+                severity: &warning.severity,
+                code: &warning.code,
+                message: &warning.message,
+                line_no: warning.line_no,
+                raw_excerpt: warning.raw_excerpt.as_deref(),
+            },
         )?;
     }
 
     tx.commit()?;
     Ok(())
+}
+
+fn attach_cached_media(
+    meta_json: &str,
+    media: &[crate::models::parser::ParsedMedia],
+    media_dir: &Path,
+) -> String {
+    if media.is_empty() {
+        return meta_json.to_string();
+    }
+
+    let mut stored = Vec::new();
+    let mut seen = HashSet::new();
+    for item in media {
+        let Some(record) = cache_media(item, media_dir) else {
+            continue;
+        };
+        let signature = serde_json::to_string(&record).unwrap_or_default();
+        if seen.insert(signature) {
+            stored.push(record);
+        }
+    }
+    if stored.is_empty() {
+        return meta_json.to_string();
+    }
+
+    let mut value = serde_json::from_str::<Value>(meta_json)
+        .unwrap_or_else(|_| Value::Object(Default::default()));
+    let Some(map) = value.as_object_mut() else {
+        return meta_json.to_string();
+    };
+    map.insert("_rescue_media".to_string(), Value::Array(stored));
+    serde_json::to_string(&value).unwrap_or_else(|_| meta_json.to_string())
+}
+
+fn cache_media(media: &crate::models::parser::ParsedMedia, media_dir: &Path) -> Option<Value> {
+    let source = media.source.trim();
+    if source.starts_with("https://") || source.starts_with("http://") {
+        return Some(serde_json::json!({
+            "kind": media.kind,
+            "mimeType": media.mime_type,
+            "url": source,
+        }));
+    }
+
+    let (bytes, declared_mime) = if source.starts_with("data:") {
+        decode_data_url(source)?
+    } else {
+        let path_text = source.strip_prefix("file://").unwrap_or(source);
+        let path = Path::new(path_text);
+        let bytes = fs::read(path).ok()?;
+        let mime = media
+            .mime_type
+            .clone()
+            .or_else(|| image_mime_from_path(path))
+            .or_else(|| image_mime_from_bytes(&bytes));
+        (bytes, mime)
+    };
+
+    let mime_type = media
+        .mime_type
+        .clone()
+        .or(declared_mime)
+        .or_else(|| image_mime_from_bytes(&bytes))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if media.kind == "image" && !mime_type.starts_with("image/") {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let filename = format!("{digest}.{}", extension_for_mime(&mime_type));
+    let cached_path = media_dir.join(&filename);
+    if !cached_path.exists() && fs::write(&cached_path, bytes).is_err() {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "id": filename,
+        "kind": media.kind,
+        "mimeType": mime_type,
+    }))
+}
+
+fn decode_data_url(source: &str) -> Option<(Vec<u8>, Option<String>)> {
+    let (header, encoded) = source.split_once(',')?;
+    let metadata = header.strip_prefix("data:")?;
+    let mut parts = metadata.split(';');
+    let mime = parts.next()?.trim().to_ascii_lowercase();
+    if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    let bytes = BASE64_STANDARD.decode(encoded.as_bytes()).ok()?;
+    Some((bytes, Some(mime)))
+}
+
+fn image_mime_from_path(path: &Path) -> Option<String> {
+    let mime = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => return None,
+    };
+    Some(mime.to_string())
+}
+
+fn image_mime_from_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png".to_string())
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg".to_string())
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif".to_string())
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp".to_string())
+    } else {
+        None
+    }
+}
+
+fn extension_for_mime(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
+fn source_file_is_current(
+    conn: &Connection,
+    abs_path: &Path,
+    size_bytes: i64,
+    mtime_ms: i64,
+    parser_version: &str,
+) -> anyhow::Result<bool> {
+    let abs_text = abs_path.to_string_lossy().into_owned();
+    Ok(conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM source_files sf
+            JOIN imports i ON i.id = sf.last_import_id
+            WHERE sf.abs_path = ?1
+              AND sf.size_bytes = ?2
+              AND sf.mtime_ms = ?3
+              AND sf.status = 'imported'
+              AND i.parser_version = ?4
+         )",
+        params![abs_text, size_bytes, mtime_ms, parser_version],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn prune_unreferenced_media(conn: &Connection, media_dir: &Path) -> anyhow::Result<()> {
+    let mut referenced = HashSet::new();
+    let mut stmt = conn.prepare("SELECT meta_json FROM session_messages")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    for meta_json in rows.filter_map(Result::ok) {
+        let Ok(value) = serde_json::from_str::<Value>(&meta_json) else {
+            continue;
+        };
+        let Some(items) = value.get("_rescue_media").and_then(Value::as_array) else {
+            continue;
+        };
+        for id in items
+            .iter()
+            .filter_map(|item| item.get("id"))
+            .filter_map(Value::as_str)
+        {
+            referenced.insert(id.to_string());
+        }
+    }
+
+    for entry in fs::read_dir(media_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        if is_managed_media_filename(&filename) && !referenced.contains(&filename) {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn is_managed_media_filename(filename: &str) -> bool {
+    let Some((digest, extension)) = filename.rsplit_once('.') else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && matches!(extension, "png" | "jpg" | "webp" | "gif" | "svg")
 }
 
 fn get_or_create_source(
@@ -568,22 +844,23 @@ fn get_or_create_source(
     }
 }
 
-fn ensure_source_file(
-    conn: &Connection,
-    source_id: &str,
-    import_id: &str,
-    abs_path: &Path,
-    rel_path: Option<&Path>,
+struct SourceFileInput<'a> {
+    source_id: &'a str,
+    import_id: &'a str,
+    abs_path: &'a Path,
+    rel_path: Option<&'a Path>,
     size_bytes: i64,
     mtime_ms: i64,
-    sha256: &str,
-    status: &str,
-) -> anyhow::Result<String> {
-    let abs_text = abs_path.to_string_lossy().into_owned();
+    sha256: &'a str,
+    status: &'a str,
+}
+
+fn ensure_source_file(conn: &Connection, input: SourceFileInput<'_>) -> anyhow::Result<String> {
+    let abs_text = input.abs_path.to_string_lossy().into_owned();
     let existing = conn
         .query_row(
             "SELECT id FROM source_files WHERE abs_path = ?1 AND sha256 = ?2",
-            params![abs_text, sha256],
+            params![abs_text, input.sha256],
             |row| row.get::<_, String>(0),
         )
         .optional()?;
@@ -591,9 +868,20 @@ fn ensure_source_file(
     if let Some(id) = existing {
         conn.execute(
             "UPDATE source_files
-             SET status = ?2, last_import_id = ?3, updated_at = ?4
+             SET rel_path = ?2, size_bytes = ?3, mtime_ms = ?4, status = ?5,
+                 last_import_id = ?6, updated_at = ?7
              WHERE id = ?1",
-            params![id, status, import_id, now_iso()],
+            params![
+                id,
+                input
+                    .rel_path
+                    .map(|path| path.to_string_lossy().into_owned()),
+                input.size_bytes,
+                input.mtime_ms,
+                input.status,
+                input.import_id,
+                now_iso()
+            ],
         )?;
         return Ok(id);
     }
@@ -607,19 +895,22 @@ fn ensure_source_file(
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             id,
-            source_id,
+            input.source_id,
             abs_text,
-            rel_path.map(|path| path.to_string_lossy().into_owned()),
-            abs_path
+            input
+                .rel_path
+                .map(|path| path.to_string_lossy().into_owned()),
+            input
+                .abs_path
                 .extension()
                 .and_then(|ext| ext.to_str())
                 .unwrap_or_default()
                 .to_ascii_lowercase(),
-            size_bytes,
-            mtime_ms,
-            sha256,
-            status,
-            import_id,
+            input.size_bytes,
+            input.mtime_ms,
+            input.sha256,
+            input.status,
+            input.import_id,
             now,
             now
         ],
@@ -665,15 +956,20 @@ fn update_import_progress(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ImportIssueInput<'a> {
+    source_file_id: Option<&'a str>,
+    severity: &'a str,
+    code: &'a str,
+    message: &'a str,
+    line_no: Option<i64>,
+    raw_excerpt: Option<&'a str>,
+}
+
 fn insert_issue(
     conn: &Connection,
     import_id: &str,
-    source_file_id: Option<&str>,
-    severity: &str,
-    code: &str,
-    message: &str,
-    line_no: Option<i64>,
-    raw_excerpt: Option<&str>,
+    issue: ImportIssueInput<'_>,
 ) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO import_issues (id, import_id, source_file_id, severity, code, message, line_no, raw_excerpt, created_at)
@@ -681,12 +977,12 @@ fn insert_issue(
         params![
             Uuid::new_v4().to_string(),
             import_id,
-            source_file_id,
-            severity,
-            code,
-            message,
-            line_no,
-            raw_excerpt,
+            issue.source_file_id,
+            issue.severity,
+            issue.code,
+            issue.message,
+            issue.line_no,
+            issue.raw_excerpt,
             now_iso()
         ],
     )?;
@@ -696,12 +992,7 @@ fn insert_issue(
 fn insert_issue_tx(
     tx: &Transaction<'_>,
     import_id: &str,
-    source_file_id: Option<&str>,
-    severity: &str,
-    code: &str,
-    message: &str,
-    line_no: Option<i64>,
-    raw_excerpt: Option<&str>,
+    issue: ImportIssueInput<'_>,
 ) -> anyhow::Result<()> {
     tx.execute(
         "INSERT INTO import_issues (id, import_id, source_file_id, severity, code, message, line_no, raw_excerpt, created_at)
@@ -709,12 +1000,12 @@ fn insert_issue_tx(
         params![
             Uuid::new_v4().to_string(),
             import_id,
-            source_file_id,
-            severity,
-            code,
-            message,
-            line_no,
-            raw_excerpt,
+            issue.source_file_id,
+            issue.severity,
+            issue.code,
+            issue.message,
+            issue.line_no,
+            issue.raw_excerpt,
             now_iso()
         ],
     )?;
@@ -899,4 +1190,127 @@ fn load_session_index(path: &Path) -> HashMap<String, SessionIndexEntry> {
     }
 
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        attach_cached_media, prune_unreferenced_media, source_file_is_current,
+        PARSER_REGISTRY_VERSION,
+    };
+    use crate::models::parser::ParsedMedia;
+    use rusqlite::{params, Connection};
+    use serde_json::Value;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn caches_inline_images_outside_message_json() {
+        let media_dir = std::env::temp_dir().join(format!("rescue-codex-media-{}", Uuid::new_v4()));
+        fs::create_dir_all(&media_dir).expect("temporary media directory should be created");
+        let media = vec![ParsedMedia {
+            kind: "image".to_string(),
+            mime_type: Some("image/png".to_string()),
+            source: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        }];
+
+        let meta_json = attach_cached_media("{}", &media, &media_dir);
+        let parsed = serde_json::from_str::<Value>(&meta_json).expect("metadata should be JSON");
+        let record = parsed
+            .get("_rescue_media")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .expect("cached media record should exist");
+        let id = record
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("cached media should have an id");
+
+        assert!(!meta_json.contains("iVBORw0KGgo"));
+        assert!(media_dir.join(id).exists());
+        fs::remove_dir_all(&media_dir).expect("temporary media directory should be removed");
+    }
+
+    #[test]
+    fn skips_only_files_imported_by_the_current_parser() {
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .expect("schema should initialize");
+        conn.execute(
+            "INSERT INTO data_sources (id, kind, label, root_path, created_at, updated_at)
+             VALUES ('source', 'test', 'Test', '/tmp', 'now', 'now')",
+            [],
+        )
+        .expect("source should insert");
+        conn.execute(
+            "INSERT INTO imports (id, source_id, mode, parser_key, parser_version, status, started_at)
+             VALUES ('import', 'source', 'test', 'auto', ?1, 'completed', 'now')",
+            [PARSER_REGISTRY_VERSION],
+        )
+        .expect("import should insert");
+        conn.execute(
+            "INSERT INTO source_files (
+                id, source_id, abs_path, file_ext, size_bytes, mtime_ms, sha256, status,
+                last_import_id, created_at, updated_at
+             ) VALUES ('file', 'source', '/tmp/session.jsonl', 'jsonl', 42, 1234, 'hash',
+                       'imported', 'import', 'now', 'now')",
+            [],
+        )
+        .expect("source file should insert");
+
+        assert!(source_file_is_current(
+            &conn,
+            std::path::Path::new("/tmp/session.jsonl"),
+            42,
+            1234,
+            PARSER_REGISTRY_VERSION,
+        )
+        .expect("current file lookup should succeed"));
+        assert!(!source_file_is_current(
+            &conn,
+            std::path::Path::new("/tmp/session.jsonl"),
+            42,
+            1235,
+            PARSER_REGISTRY_VERSION,
+        )
+        .expect("changed file lookup should succeed"));
+        assert!(!source_file_is_current(
+            &conn,
+            std::path::Path::new("/tmp/session.jsonl"),
+            42,
+            1234,
+            "registry-next",
+        )
+        .expect("parser upgrade lookup should succeed"));
+    }
+
+    #[test]
+    fn removes_only_unreferenced_managed_media() {
+        let media_dir = std::env::temp_dir().join(format!("rescue-codex-prune-{}", Uuid::new_v4()));
+        fs::create_dir_all(&media_dir).expect("temporary media directory should be created");
+        let kept = format!("{}.png", "a".repeat(64));
+        let stale = format!("{}.png", "b".repeat(64));
+        fs::write(media_dir.join(&kept), b"kept").expect("kept media should be written");
+        fs::write(media_dir.join(&stale), b"stale").expect("stale media should be written");
+        fs::write(media_dir.join("user-file.txt"), b"untouched")
+            .expect("unmanaged file should be written");
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+        conn.execute_batch("CREATE TABLE session_messages (meta_json TEXT NOT NULL)")
+            .expect("test table should initialize");
+        conn.execute(
+            "INSERT INTO session_messages (meta_json) VALUES (?1)",
+            params![serde_json::json!({
+                "_rescue_media": [{"id": kept, "kind": "image"}]
+            })
+            .to_string()],
+        )
+        .expect("media reference should insert");
+
+        prune_unreferenced_media(&conn, &media_dir).expect("media pruning should succeed");
+
+        assert!(media_dir.join(&kept).exists());
+        assert!(!media_dir.join(&stale).exists());
+        assert!(media_dir.join("user-file.txt").exists());
+        fs::remove_dir_all(&media_dir).expect("temporary media directory should be removed");
+    }
 }

@@ -51,7 +51,3 @@ pub fn open_connection(path: &Path) -> anyhow::Result<Connection> {
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
-
-pub fn now_millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
-}

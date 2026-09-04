@@ -1,4 +1,7 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
 use serde_json::Value as JsonValue;
@@ -13,8 +16,8 @@ use crate::{
         AccountInfo, ActivityPoint, AppInfo, BreakdownDatum, ChartDatum, CorrelationDatum,
         DashboardFilters, DashboardOverview, DashboardScope, DashboardSummary, ImportIssueRecord,
         ProjectSummary, ProjectWindowRecord, RankedTurnRecord, RecentImport, ScatterDatum,
-        SessionDetail, SessionListFilters, SessionListResponse, SessionMessageRecord,
-        SessionSummary, TokenUsageSummary, ToolMetricDatum,
+        SessionDetail, SessionListFilters, SessionListResponse, SessionMediaRef,
+        SessionMessageRecord, SessionSummary, TokenUsageSummary, ToolMetricDatum,
     },
     state::AppState,
 };
@@ -206,6 +209,7 @@ struct TurnRecord {
     input_tokens: i64,
     output_tokens: i64,
     cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
     reasoning_output_tokens: i64,
     total_tokens: i64,
     last_token_signature: Option<String>,
@@ -274,9 +278,7 @@ struct TurnAnalytics {
     prompts_with_command: i64,
     prompts_with_path_or_command: i64,
     repeated_turn_contexts: i64,
-    context_compactions: i64,
     aborted_turns: i64,
-    rolled_back_turns: i64,
     project_switches: i64,
     workspace_switches: i64,
     model_timeline: BTreeMap<String, HashMap<String, i64>>,
@@ -300,6 +302,7 @@ struct TokenUsageAccumulator {
     input_tokens: i64,
     output_tokens: i64,
     cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
     reasoning_output_tokens: i64,
     total_tokens: i64,
 }
@@ -376,6 +379,32 @@ pub fn list_sessions(
 ) -> anyhow::Result<SessionListResponse> {
     let conn = open_connection(state.db_path())?;
     load_sessions(&conn, &filters)
+}
+
+pub fn load_session_media(state: &AppState, id: &str) -> anyhow::Result<String> {
+    let (digest, extension) = id
+        .rsplit_once('.')
+        .filter(|(digest, _)| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        })
+        .ok_or_else(|| anyhow::anyhow!("无效的媒体标识"))?;
+    let mime_type = match extension.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        _ => anyhow::bail!("不支持的媒体格式"),
+    };
+    let filename = format!("{digest}.{extension}");
+    let bytes = fs::read(state.media_dir().join(filename))?;
+    Ok(format!(
+        "data:{mime_type};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    ))
 }
 
 pub(crate) fn load_dashboard_summary(
@@ -675,7 +704,7 @@ fn resolve_dashboard_scope(
 ) -> anyhow::Result<ResolvedDashboardScope> {
     let selected_project = normalize_project_filter(filters.project.as_deref());
     let mut stmt = conn.prepare(&format!(
-        "SELECT COALESCE(updated_at, started_at) AS ts, cwd
+        "SELECT COALESCE(updated_at, started_at) AS ts, thread_title, cwd, first_user_message
          FROM sessions
          WHERE {SESSION_DATE_SQL} <> ''"
     ))?;
@@ -683,14 +712,21 @@ fn resolve_dashboard_scope(
         Ok((
             row.get::<_, Option<String>>(0)?,
             row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
         ))
     })?;
     let mut available_start: Option<NaiveDate> = None;
     let mut available_end: Option<NaiveDate> = None;
 
     for row in rows.filter_map(Result::ok) {
-        let (ts, cwd) = row;
-        if !matches_project_filter(cwd.as_deref(), selected_project.as_deref()) {
+        let (ts, thread_title, cwd, first_user_message) = row;
+        let project_label = project_label_for_context(
+            cwd.as_deref(),
+            thread_title.as_deref(),
+            first_user_message.as_deref(),
+        );
+        if !matches_project_filter_label(&project_label, selected_project.as_deref()) {
             continue;
         }
         let Some(date) = ts
@@ -775,7 +811,7 @@ fn normalize_project_filter(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("all"))
-        .map(|value| value.to_ascii_lowercase())
+        .map(normalize_project_label)
 }
 
 fn project_label_from_cwd(value: &str) -> String {
@@ -792,27 +828,86 @@ fn project_label_from_option(value: Option<&str>) -> String {
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
-fn matches_project_filter(cwd: Option<&str>, selected_project: Option<&str>) -> bool {
+fn project_label_for_session(session: &SessionSnapshot) -> String {
+    project_label_for_context(
+        session.cwd.as_deref(),
+        session.thread_title.as_deref(),
+        session.first_user_message.as_deref(),
+    )
+}
+
+fn project_label_for_context(
+    cwd: Option<&str>,
+    thread_title: Option<&str>,
+    first_user_message: Option<&str>,
+) -> String {
+    if let Some(cwd) = cwd.filter(|value| !value.trim().is_empty()) {
+        if is_codex_conversation_workspace(cwd) {
+            return clean_project_label(thread_title)
+                .or_else(|| clean_project_label(first_user_message))
+                .unwrap_or_else(|| project_label_from_cwd(cwd));
+        }
+
+        return project_label_from_cwd(cwd);
+    }
+
+    clean_project_label(thread_title)
+        .or_else(|| clean_project_label(first_user_message))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn clean_project_label(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    const MAX_CHARS: usize = 48;
+    let mut output = String::new();
+    for (index, character) in value.chars().enumerate() {
+        if index >= MAX_CHARS {
+            output.push_str("...");
+            break;
+        }
+        output.push(character);
+    }
+    Some(output)
+}
+
+fn normalize_project_label(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn matches_project_filter_label(label: &str, selected_project: Option<&str>) -> bool {
     match selected_project {
         None => true,
-        Some(selected_project) => cwd
-            .map(normalize_workspace)
-            .map(|value| project_key(&value))
-            .is_some_and(|value| value == selected_project),
+        Some(selected_project) => normalize_project_label(label) == selected_project,
     }
 }
 
 fn load_project_options(conn: &Connection) -> anyhow::Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT cwd FROM sessions WHERE COALESCE(cwd, '') <> ''")?;
-    let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
+    let mut stmt = conn.prepare(
+        "SELECT thread_title, cwd, first_user_message
+         FROM sessions
+         WHERE COALESCE(cwd, thread_title, first_user_message, '') <> ''",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
     let mut labels = HashMap::<String, String>::new();
-    for cwd in rows.filter_map(Result::ok).flatten() {
-        let normalized = normalize_workspace(&cwd);
-        let key = project_key(&normalized);
+    for (thread_title, cwd, first_user_message) in rows.filter_map(Result::ok) {
+        let label = project_label_for_context(
+            cwd.as_deref(),
+            thread_title.as_deref(),
+            first_user_message.as_deref(),
+        );
         labels
-            .entry(key)
-            .or_insert_with(|| project_label_from_cwd(&cwd));
+            .entry(normalize_project_label(&label))
+            .or_insert(label);
     }
     let mut items = labels.into_values().collect::<Vec<_>>();
     items.sort();
@@ -945,7 +1040,12 @@ fn load_session_snapshots(
             first_user_message,
             value,
         ) = row;
-        if !matches_project_filter(cwd.as_deref(), selected_project) {
+        let project_label = project_label_for_context(
+            cwd.as_deref(),
+            thread_title.as_deref(),
+            first_user_message.as_deref(),
+        );
+        if !matches_project_filter_label(&project_label, selected_project) {
             continue;
         }
         if let Some(timestamp) = parse_rfc3339_utc(&value) {
@@ -1554,6 +1654,7 @@ fn build_token_usage_summary(turn_analytics: &TurnAnalytics) -> TokenUsageSummar
         summary.input_tokens += turn.input_tokens;
         summary.output_tokens += turn.output_tokens;
         summary.cached_input_tokens += turn.cached_input_tokens;
+        summary.cache_write_input_tokens += turn.cache_write_input_tokens;
         summary.reasoning_output_tokens += turn.reasoning_output_tokens;
         summary.total_tokens += turn.total_tokens;
     }
@@ -1583,10 +1684,12 @@ fn build_ranked_turns(
             let meta = session_meta.get(&turn.session_id);
             RankedTurnRecord {
                 session_id: turn.session_id.clone(),
-                project: project_label_from_option(
+                project: project_label_for_context(
                     turn.cwd
                         .as_deref()
                         .or_else(|| meta.and_then(|item| item.cwd.as_deref())),
+                    meta.and_then(|item| item.thread_title.as_deref()),
+                    meta.and_then(|item| item.first_user_message.as_deref()),
                 ),
                 thread_title: meta.and_then(|item| item.thread_title.clone()),
                 prompt_preview: turn.user_text.clone(),
@@ -1594,6 +1697,7 @@ fn build_ranked_turns(
                 input_tokens: turn.input_tokens,
                 output_tokens: turn.output_tokens,
                 cached_input_tokens: turn.cached_input_tokens,
+                cache_write_input_tokens: turn.cache_write_input_tokens,
                 reasoning_output_tokens: turn.reasoning_output_tokens,
                 first_response_sec: turn.first_response_sec(),
                 completion_sec: turn.completion_sec(),
@@ -1638,7 +1742,7 @@ fn build_project_timeline(
         .collect::<HashMap<_, _>>();
     let mut project_counts = HashMap::<String, i64>::new();
     for session in sessions {
-        let label = project_label_from_option(session.cwd.as_deref());
+        let label = project_label_for_session(session);
         *project_counts.entry(label).or_default() += 1;
     }
     let top_projects = top_labels(&project_counts, 6);
@@ -1652,11 +1756,14 @@ fn build_project_timeline(
             continue;
         };
         let bucket = bucket_label_for_timestamp(anchor_ts, scope.granularity);
-        let label = project_label_from_option(turn.cwd.as_deref().or_else(|| {
-            session_meta
-                .get(&turn.session_id)
-                .and_then(|item| item.cwd.as_deref())
-        }));
+        let meta = session_meta.get(&turn.session_id);
+        let label = project_label_for_context(
+            turn.cwd
+                .as_deref()
+                .or_else(|| meta.and_then(|item| item.cwd.as_deref())),
+            meta.and_then(|item| item.thread_title.as_deref()),
+            meta.and_then(|item| item.first_user_message.as_deref()),
+        );
         if top_projects.contains(&label) {
             increment_breakdown(&mut buckets, bucket, &label, 1);
         }
@@ -1688,7 +1795,7 @@ fn build_project_summaries(
 
     let mut acc = HashMap::<String, ProjectAccumulator>::new();
     for session in sessions {
-        let label = project_label_from_option(session.cwd.as_deref());
+        let label = project_label_for_session(session);
         acc.entry(label).or_default().session_count += 1;
     }
     for turn in turn_analytics
@@ -1696,11 +1803,14 @@ fn build_project_summaries(
         .iter()
         .filter(|turn| turn.user_ts.is_some())
     {
-        let label = project_label_from_option(turn.cwd.as_deref().or_else(|| {
-            session_meta
-                .get(&turn.session_id)
-                .and_then(|item| item.cwd.as_deref())
-        }));
+        let meta = session_meta.get(&turn.session_id);
+        let label = project_label_for_context(
+            turn.cwd
+                .as_deref()
+                .or_else(|| meta.and_then(|item| item.cwd.as_deref())),
+            meta.and_then(|item| item.thread_title.as_deref()),
+            meta.and_then(|item| item.first_user_message.as_deref()),
+        );
         let entry = acc.entry(label).or_default();
         entry.question_count += 1;
         entry.total_tokens += turn.total_tokens;
@@ -1777,7 +1887,7 @@ fn build_project_windows(
                 turn_totals.get(&session.id).copied().unwrap_or_default();
             ProjectWindowRecord {
                 session_id: session.id.clone(),
-                project: project_label_from_option(session.cwd.as_deref()),
+                project: project_label_for_session(session),
                 thread_title: session.thread_title.clone(),
                 started_at: session.started_at.clone(),
                 updated_at: session.updated_at.clone(),
@@ -1814,7 +1924,7 @@ fn build_project_parallelism(sessions: &[SessionSnapshot], limit: usize) -> Vec<
         else {
             continue;
         };
-        let label = project_label_from_option(session.cwd.as_deref());
+        let label = project_label_for_session(session);
         let entry = ranges.entry(label).or_default();
         entry.push((start, 1));
         entry.push((end, -1));
@@ -1987,6 +2097,7 @@ fn fetch_session_messages(
     )?;
     let rows = stmt.query_map(params![session_id], |row| {
         let meta_json: String = row.get(8)?;
+        let media = extract_message_media(&meta_json);
         Ok(SessionMessageRecord {
             id: row.get(0)?,
             turn_id: row.get(1)?,
@@ -1996,7 +2107,12 @@ fn fetch_session_messages(
             ts: row.get(5)?,
             tool_name: row.get(6)?,
             phase: row.get(7)?,
-            image_urls: extract_message_image_urls(&meta_json),
+            image_urls: if media.is_empty() {
+                extract_message_image_urls(&meta_json)
+            } else {
+                Vec::new()
+            },
+            media,
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())
@@ -2014,10 +2130,12 @@ fn extract_message_image_urls(meta_json: &str) -> Vec<String> {
 
 fn collect_image_urls(value: &JsonValue, urls: &mut Vec<String>) {
     match value {
-        JsonValue::String(text) if text.starts_with("data:image/") => {
-            if !urls.iter().any(|url| url == text) {
-                urls.push(text.clone());
-            }
+        JsonValue::String(text)
+            if text.starts_with("data:image/")
+                && !text.contains("[truncated ")
+                && !urls.iter().any(|url| url == text) =>
+        {
+            urls.push(text.clone());
         }
         JsonValue::Array(items) => {
             for item in items {
@@ -2031,6 +2149,37 @@ fn collect_image_urls(value: &JsonValue, urls: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+fn extract_message_media(meta_json: &str) -> Vec<SessionMediaRef> {
+    let Ok(value) = serde_json::from_str::<JsonValue>(meta_json) else {
+        return Vec::new();
+    };
+    value
+        .get("_rescue_media")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let kind = item.get("kind").and_then(JsonValue::as_str)?.to_string();
+            Some(SessionMediaRef {
+                id: item
+                    .get("id")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                kind,
+                mime_type: item
+                    .get("mimeType")
+                    .or_else(|| item.get("mime_type"))
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+                url: item
+                    .get("url")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned),
+            })
+        })
+        .collect()
 }
 
 fn map_session_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
@@ -2069,12 +2218,47 @@ fn session_snapshot_to_summary(item: SessionSnapshot) -> SessionSummary {
     }
 }
 
+fn sessions_with_event(
+    conn: &Connection,
+    scope: &ResolvedDashboardScope,
+    outer_type: &str,
+    inner_type: Option<&str>,
+) -> anyhow::Result<HashSet<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT e.session_id
+         FROM session_events_raw e
+         JOIN sessions s ON s.id = e.session_id
+         WHERE {SESSION_DATE_SQL} >= ?1
+           AND {SESSION_DATE_SQL} <= ?2
+           AND e.outer_type = ?3
+           AND (?4 IS NULL OR e.inner_type = ?4)"
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            scope.start.format("%Y-%m-%d").to_string(),
+            scope.end.format("%Y-%m-%d").to_string(),
+            outer_type,
+            inner_type,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
 fn build_turn_analytics(
     conn: &Connection,
     scope: &ResolvedDashboardScope,
     selected_project: Option<&str>,
     sessions: &[SessionSnapshot],
 ) -> anyhow::Result<TurnAnalytics> {
+    let sessions_with_completed_items =
+        sessions_with_event(conn, scope, "event_msg", Some("item_completed"))?;
+    let sessions_with_token_usage_records =
+        sessions_with_event(conn, scope, "token_usage_record", None)?;
+    let sessions_with_patch_apply_ends =
+        sessions_with_event(conn, scope, "event_msg", Some("patch_apply_end"))?;
+    let sessions_with_web_search_ends =
+        sessions_with_event(conn, scope, "event_msg", Some("web_search_end"))?;
     let mut stmt = conn.prepare(&format!(
         "SELECT e.session_id, e.seq, e.ts, e.outer_type, e.inner_type, e.payload_json
              FROM session_events_raw e
@@ -2104,20 +2288,31 @@ fn build_turn_analytics(
     let mut current_turn_id: Option<String> = None;
     let mut turns = HashMap::<String, TurnRecord>::new();
     let mut all_turns = Vec::<TurnRecord>::new();
-    let mut context_compactions = 0_i64;
-    let mut rolled_back_turns = 0_i64;
     let mut interruption_timeline = BTreeMap::<String, HashMap<String, i64>>::new();
     let mut tool_types = HashMap::<String, i64>::new();
     let mut tool_metrics = HashMap::<String, ToolMetricAccumulator>::new();
     let mut search_terms = HashMap::<String, i64>::new();
     let mut search_hours = [0_i64; 24];
     let mut pending_calls = HashMap::<String, String>::new();
+    let mut ignored_result_calls = HashSet::<String>::new();
+    let mut image_generation_calls = HashSet::<String>::new();
+    let mut completed_image_generations = HashSet::<String>::new();
+    let mut completed_patch_calls = HashSet::<String>::new();
+    let mut completed_web_searches = HashSet::<String>::new();
+    let mut seen_token_usage_responses = HashSet::<String>::new();
     let mut project_compactions = HashMap::<String, i64>::new();
     let session_cwds = sessions
         .iter()
         .map(|item| (item.id.clone(), item.cwd.clone()))
         .collect::<HashMap<_, _>>();
+    let session_project_labels = sessions
+        .iter()
+        .map(|item| (item.id.clone(), project_label_for_session(item)))
+        .collect::<HashMap<_, _>>();
     let mut current_session_project: Option<String> = None;
+    let mut current_session_model: Option<String> = None;
+    let mut current_session_effort: Option<String> = None;
+    let mut current_session_cwd: Option<String> = None;
 
     for row in rows.filter_map(Result::ok) {
         let (session_id, _seq, ts, outer_type, inner_type, payload_json) = row;
@@ -2125,10 +2320,26 @@ fn build_turn_analytics(
             flush_turns(&mut turns, &mut all_turns);
             current_session_id = session_id.clone();
             current_turn_id = None;
+            pending_calls.clear();
+            ignored_result_calls.clear();
+            image_generation_calls.clear();
+            completed_image_generations.clear();
+            completed_patch_calls.clear();
+            completed_web_searches.clear();
+            seen_token_usage_responses.clear();
+            current_session_model = None;
+            current_session_effort = None;
+            current_session_cwd = session_cwds.get(&session_id).cloned().flatten();
             current_session_project = session_cwds
                 .get(&session_id)
                 .and_then(|value| value.as_deref())
-                .map(project_label_from_cwd);
+                .map(|cwd| {
+                    project_label_for_context(
+                        Some(cwd),
+                        session_project_labels.get(&session_id).map(String::as_str),
+                        None,
+                    )
+                });
         }
 
         let payload = serde_json::from_str::<JsonValue>(&payload_json).unwrap_or(JsonValue::Null);
@@ -2147,6 +2358,12 @@ fn build_turn_analytics(
                         .and_then(JsonValue::as_i64)
                         .and_then(unix_seconds_to_utc)
                         .or(timestamp);
+                    turn.model = turn.model.clone().or_else(|| current_session_model.clone());
+                    turn.effort = turn
+                        .effort
+                        .clone()
+                        .or_else(|| current_session_effort.clone());
+                    turn.cwd = turn.cwd.clone().or_else(|| current_session_cwd.clone());
                 }
             }
             ("turn_context", _) => {
@@ -2180,10 +2397,66 @@ fn build_turn_analytics(
                         .and_then(JsonValue::as_str)
                         .map(ToOwned::to_owned)
                         .or_else(|| turn.cwd.clone());
+                    current_session_model = turn.model.clone();
+                    current_session_effort = turn.effort.clone();
+                    current_session_cwd = turn.cwd.clone();
                     if let Some(cwd) = turn.cwd.as_deref() {
-                        current_session_project = Some(project_label_from_cwd(cwd));
+                        current_session_project = Some(project_label_for_context(
+                            Some(cwd),
+                            session_project_labels.get(&session_id).map(String::as_str),
+                            None,
+                        ));
                     }
                 }
+            }
+            ("event_msg", Some("thread_settings_applied")) => {
+                if let Some(settings) = payload.get("thread_settings") {
+                    current_session_model = settings
+                        .get("model")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned)
+                        .or(current_session_model);
+                    current_session_effort = settings
+                        .get("reasoning_effort")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned)
+                        .or(current_session_effort);
+                    current_session_cwd = settings
+                        .get("cwd")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned)
+                        .or(current_session_cwd);
+                    if let Some(cwd) = current_session_cwd.as_deref() {
+                        current_session_project = Some(project_label_for_context(
+                            Some(cwd),
+                            session_project_labels.get(&session_id).map(String::as_str),
+                            None,
+                        ));
+                    }
+                    if let Some(turn_id) = current_turn_id.as_deref() {
+                        let turn = ensure_turn(&mut turns, turn_id);
+                        if turn.session_id.is_empty() {
+                            turn.session_id = session_id.clone();
+                        }
+                        turn.model = current_session_model.clone().or_else(|| turn.model.clone());
+                        turn.effort = current_session_effort
+                            .clone()
+                            .or_else(|| turn.effort.clone());
+                        turn.cwd = current_session_cwd.clone().or_else(|| turn.cwd.clone());
+                    }
+                }
+            }
+            ("world_state", _) => {
+                current_session_model = payload
+                    .get("model")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+                    .or(current_session_model);
+                current_session_cwd = payload
+                    .get("cwd")
+                    .and_then(JsonValue::as_str)
+                    .map(ToOwned::to_owned)
+                    .or(current_session_cwd);
             }
             ("event_msg", Some("user_message")) => {
                 if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
@@ -2224,16 +2497,45 @@ fn build_turn_analytics(
             }
             ("response_item", Some("function_call"))
             | ("response_item", Some("custom_tool_call"))
-            | ("response_item", Some("web_search_call")) => {
+            | ("response_item", Some("web_search_call"))
+            | ("response_item", Some("tool_search_call"))
+            | ("response_item", Some("image_generation_call")) => {
+                let call_id = payload
+                    .get("call_id")
+                    .or_else(|| payload.get("id"))
+                    .and_then(JsonValue::as_str);
+                let is_image_generation =
+                    matches!(inner_type.as_deref(), Some("image_generation_call"));
+                if sessions_with_completed_items.contains(&session_id) && !is_image_generation {
+                    if let Some(call_id) = call_id {
+                        ignored_result_calls.insert(call_id.to_string());
+                    }
+                    continue;
+                }
+
                 let label = tool_label(inner_type.as_deref(), &payload);
+                let is_web_search = matches!(inner_type.as_deref(), Some("web_search_call"));
+                let backed_by_patch_end =
+                    label == "apply_patch" && sessions_with_patch_apply_ends.contains(&session_id);
+                if backed_by_patch_end {
+                    if let Some(call_id) = call_id {
+                        ignored_result_calls.insert(call_id.to_string());
+                    }
+                    continue;
+                }
+                let backed_by_web_search_end =
+                    is_web_search && sessions_with_web_search_ends.contains(&session_id);
                 *tool_types.entry(label.clone()).or_default() += 1;
                 tool_metrics.entry(label.clone()).or_default().total += 1;
 
-                if let Some(call_id) = payload.get("call_id").and_then(JsonValue::as_str) {
+                if let Some(call_id) = call_id {
                     pending_calls.insert(call_id.to_string(), label.clone());
+                    if is_image_generation {
+                        image_generation_calls.insert(call_id.to_string());
+                    }
                 }
 
-                if matches!(inner_type.as_deref(), Some("web_search_call")) {
+                if is_web_search && !backed_by_web_search_end {
                     if let Some(event_ts) =
                         timestamp.filter(|value| scope.contains_date(to_local_date(*value)))
                     {
@@ -2253,7 +2555,35 @@ fn build_turn_analytics(
                     turn.tool_call_count += 1;
                 }
             }
+            ("event_msg", Some("mcp_tool_call_end")) => {
+                if sessions_with_completed_items.contains(&session_id) {
+                    continue;
+                }
+                let label = mcp_tool_label(&payload);
+                *tool_types.entry(label.clone()).or_default() += 1;
+                let metric = tool_metrics.entry(label).or_default();
+                metric.total += 1;
+                if mcp_tool_is_error(&payload) {
+                    metric.failure += 1;
+                } else {
+                    metric.success += 1;
+                }
+                if let Some(duration) = mcp_tool_duration_seconds(&payload) {
+                    metric.duration_total_sec += duration;
+                    metric.duration_samples += 1;
+                }
+                if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                    let turn = ensure_turn(&mut turns, &turn_id);
+                    if turn.session_id.is_empty() {
+                        turn.session_id = session_id.clone();
+                    }
+                    turn.tool_call_count += 1;
+                }
+            }
             ("event_msg", Some("view_image_tool_call")) => {
+                if sessions_with_completed_items.contains(&session_id) {
+                    continue;
+                }
                 *tool_types.entry("view_image".to_string()).or_default() += 1;
                 let metric = tool_metrics.entry("view_image".to_string()).or_default();
                 metric.total += 1;
@@ -2266,7 +2596,69 @@ fn build_turn_analytics(
                     turn.tool_call_count += 1;
                 }
             }
+            ("event_msg", Some("item_completed")) => {
+                let Some(item) = payload.get("item") else {
+                    continue;
+                };
+                let Some(label) = completed_item_tool_label(item) else {
+                    continue;
+                };
+                *tool_types.entry(label.clone()).or_default() += 1;
+                let metric = tool_metrics.entry(label.clone()).or_default();
+                metric.total += 1;
+                if completed_item_failed(item) {
+                    metric.failure += 1;
+                } else {
+                    metric.success += 1;
+                }
+                if let Some(duration) = completed_item_duration_seconds(&payload, item) {
+                    metric.duration_total_sec += duration;
+                    metric.duration_samples += 1;
+                }
+
+                if item
+                    .get("kind")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|kind| kind == "web.search")
+                {
+                    if let Some(event_ts) =
+                        timestamp.filter(|value| scope.contains_date(to_local_date(*value)))
+                    {
+                        search_hours[event_ts.with_timezone(&Local).hour() as usize] += 1;
+                    }
+                    for query in extract_search_queries(item) {
+                        update_prompt_terms(&mut search_terms, &query);
+                    }
+                }
+
+                if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                    let turn = ensure_turn(&mut turns, &turn_id);
+                    if turn.session_id.is_empty() {
+                        turn.session_id = session_id.clone();
+                    }
+                    turn.tool_call_count += 1;
+                }
+            }
+            ("token_usage_record", _) => {
+                let response_id = payload.get("response_id").and_then(JsonValue::as_str);
+                if response_id.is_some_and(|id| !seen_token_usage_responses.insert(id.to_string()))
+                {
+                    continue;
+                }
+                if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                    let turn = ensure_turn(&mut turns, &turn_id);
+                    if turn.session_id.is_empty() {
+                        turn.session_id = session_id.clone();
+                    }
+                    if let Some(usage) = extract_token_usage_record(&payload) {
+                        apply_token_usage(turn, &usage);
+                    }
+                }
+            }
             ("event_msg", Some("token_count")) | ("token_count", _) => {
+                if sessions_with_token_usage_records.contains(&session_id) {
+                    continue;
+                }
                 if let Some(turn_id) = current_turn_id.as_deref() {
                     let turn = ensure_turn(&mut turns, turn_id);
                     if turn.session_id.is_empty() {
@@ -2274,40 +2666,40 @@ fn build_turn_analytics(
                     }
                     if let Some(usage) = extract_last_token_usage(&payload) {
                         let signature = format!(
-                            "{}:{}:{}:{}:{}",
+                            "{}:{}:{}:{}:{}:{}",
                             usage.cached_input_tokens,
+                            usage.cache_write_input_tokens,
                             usage.input_tokens,
                             usage.output_tokens,
                             usage.reasoning_output_tokens,
                             usage.total_tokens
                         );
                         if turn.last_token_signature.as_deref() != Some(signature.as_str()) {
-                            turn.cached_input_tokens += usage.cached_input_tokens;
-                            turn.input_tokens += usage.input_tokens;
-                            turn.output_tokens += usage.output_tokens;
-                            turn.reasoning_output_tokens += usage.reasoning_output_tokens;
-                            turn.total_tokens += usage.total_tokens;
+                            apply_token_usage(turn, &usage);
                             turn.last_token_signature = Some(signature);
                         }
                     }
                 }
             }
             ("response_item", Some("function_call_output")) => {
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id.is_some_and(|call_id| ignored_result_calls.remove(call_id)) {
+                    continue;
+                }
                 let label = payload
                     .get("call_id")
                     .and_then(JsonValue::as_str)
                     .and_then(|call_id| pending_calls.remove(call_id))
                     .unwrap_or_else(|| "tool_call".to_string());
                 let metric = tool_metrics.entry(label).or_default();
-                let output = payload
-                    .get("output")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                let exit_code = parse_function_call_exit_code(output);
-                let duration = parse_wall_time_seconds(output);
+                let (exit_code, duration) = parse_tool_output(payload.get("output"));
                 apply_tool_result(metric, exit_code, duration);
             }
             ("response_item", Some("custom_tool_call_output")) => {
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id.is_some_and(|call_id| ignored_result_calls.remove(call_id)) {
+                    continue;
+                }
                 let label = payload
                     .get("call_id")
                     .and_then(JsonValue::as_str)
@@ -2316,6 +2708,142 @@ fn build_turn_analytics(
                 let metric = tool_metrics.entry(label).or_default();
                 let (exit_code, duration) = parse_custom_tool_output(payload.get("output"));
                 apply_tool_result(metric, exit_code, duration);
+            }
+            ("response_item", Some("tool_search_output")) => {
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id.is_some_and(|call_id| ignored_result_calls.remove(call_id)) {
+                    continue;
+                }
+                let label = payload
+                    .get("call_id")
+                    .and_then(JsonValue::as_str)
+                    .and_then(|call_id| pending_calls.remove(call_id))
+                    .unwrap_or_else(|| "tool_search".to_string());
+                let metric = tool_metrics.entry(label).or_default();
+                if metric.total == 0 {
+                    *tool_types.entry("tool_search".to_string()).or_default() += 1;
+                    metric.total += 1;
+                }
+                metric.success += 1;
+            }
+            ("event_msg", Some("patch_apply_end")) => {
+                if sessions_with_completed_items.contains(&session_id) {
+                    continue;
+                }
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id.is_some_and(|id| !completed_patch_calls.insert(id.to_string())) {
+                    continue;
+                }
+                let label = "apply_patch".to_string();
+                *tool_types.entry(label.clone()).or_default() += 1;
+                let metric = tool_metrics.entry(label).or_default();
+                metric.total += 1;
+                let succeeded = payload
+                    .get("success")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or_else(|| {
+                        !payload
+                            .get("status")
+                            .and_then(JsonValue::as_str)
+                            .is_some_and(|status| {
+                                matches!(status, "failed" | "error" | "cancelled" | "aborted")
+                            })
+                    });
+                if succeeded {
+                    metric.success += 1;
+                } else {
+                    metric.failure += 1;
+                }
+                if let Some(duration) = payload.get("duration_sec").and_then(JsonValue::as_f64) {
+                    metric.duration_total_sec += duration;
+                    metric.duration_samples += 1;
+                }
+                if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                    let turn = ensure_turn(&mut turns, &turn_id);
+                    if turn.session_id.is_empty() {
+                        turn.session_id = session_id.clone();
+                    }
+                    turn.tool_call_count += 1;
+                }
+            }
+            ("event_msg", Some("web_search_end")) => {
+                if sessions_with_completed_items.contains(&session_id) {
+                    continue;
+                }
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id.is_some_and(|id| !completed_web_searches.insert(id.to_string())) {
+                    continue;
+                }
+                let pending_label = call_id.and_then(|id| pending_calls.remove(id));
+                let had_call = pending_label.is_some();
+                let label = pending_label.unwrap_or_else(|| "web_search".to_string());
+                if !had_call {
+                    *tool_types.entry(label.clone()).or_default() += 1;
+                }
+                let metric = tool_metrics.entry(label).or_default();
+                if !had_call {
+                    metric.total += 1;
+                }
+                metric.success += 1;
+                if let Some(event_ts) =
+                    timestamp.filter(|value| scope.contains_date(to_local_date(*value)))
+                {
+                    search_hours[event_ts.with_timezone(&Local).hour() as usize] += 1;
+                }
+                for query in extract_search_queries(&payload) {
+                    update_prompt_terms(&mut search_terms, &query);
+                }
+                if !had_call {
+                    if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                        let turn = ensure_turn(&mut turns, &turn_id);
+                        if turn.session_id.is_empty() {
+                            turn.session_id = session_id.clone();
+                        }
+                        turn.tool_call_count += 1;
+                    }
+                }
+            }
+            ("event_msg", Some("image_generation_end")) => {
+                let Some(succeeded) = image_generation_outcome(&payload) else {
+                    continue;
+                };
+                let call_id = payload.get("call_id").and_then(JsonValue::as_str);
+                if call_id
+                    .is_some_and(|call_id| !completed_image_generations.insert(call_id.to_string()))
+                {
+                    continue;
+                }
+                let had_call =
+                    call_id.is_some_and(|call_id| image_generation_calls.contains(call_id));
+                let label = call_id
+                    .and_then(|call_id| pending_calls.remove(call_id))
+                    .unwrap_or_else(|| "image_generation".to_string());
+                if !had_call {
+                    *tool_types.entry(label.clone()).or_default() += 1;
+                }
+                let metric = tool_metrics.entry(label).or_default();
+                if !had_call {
+                    metric.total += 1;
+                }
+                if succeeded {
+                    metric.success += 1;
+                } else {
+                    metric.failure += 1;
+                }
+            }
+            ("event_msg", Some("sub_agent_activity")) => {
+                let label = "sub_agent".to_string();
+                *tool_types.entry(label.clone()).or_default() += 1;
+                let metric = tool_metrics.entry(label).or_default();
+                metric.total += 1;
+                metric.success += 1;
+                if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                    let turn = ensure_turn(&mut turns, &turn_id);
+                    if turn.session_id.is_empty() {
+                        turn.session_id = session_id.clone();
+                    }
+                    turn.tool_call_count += 1;
+                }
             }
             ("event_msg", Some("task_complete")) => {
                 if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
@@ -2353,7 +2881,6 @@ fn build_turn_analytics(
                 if let Some(event_ts) =
                     timestamp.filter(|value| scope.contains_date(to_local_date(*value)))
                 {
-                    rolled_back_turns += 1;
                     let bucket = bucket_label_for_timestamp(event_ts, scope.granularity);
                     increment_breakdown(&mut interruption_timeline, bucket, "Rollback", 1);
                 }
@@ -2361,7 +2888,6 @@ fn build_turn_analytics(
             ("event_msg", Some("context_compacted")) | ("compacted", _) => {
                 if let Some(event_ts) = timestamp {
                     if scope.contains_date(to_local_date(event_ts)) {
-                        context_compactions += 1;
                         if let Some(project) = current_session_project.clone() {
                             *project_compactions.entry(project).or_default() += 1;
                         }
@@ -2380,20 +2906,23 @@ fn build_turn_analytics(
     }
 
     flush_turns(&mut turns, &mut all_turns);
-    Ok(summarize_turns(
-        all_turns,
-        scope,
-        context_compactions,
-        rolled_back_turns,
+    let analytics = TurnAnalytics {
         interruption_timeline,
         tool_types,
         tool_metrics,
         search_terms,
         search_hours,
         project_compactions,
+        ..Default::default()
+    };
+    summarize_turns(
+        all_turns,
+        scope,
+        analytics,
         selected_project,
         &session_cwds,
-    )?)
+        &session_project_labels,
+    )
 }
 
 fn flush_turns(turns: &mut HashMap<String, TurnRecord>, all_turns: &mut Vec<TurnRecord>) {
@@ -2405,28 +2934,11 @@ fn flush_turns(turns: &mut HashMap<String, TurnRecord>, all_turns: &mut Vec<Turn
 fn summarize_turns(
     all_turns: Vec<TurnRecord>,
     scope: &ResolvedDashboardScope,
-    context_compactions: i64,
-    rolled_back_turns: i64,
-    interruption_timeline: BTreeMap<String, HashMap<String, i64>>,
-    tool_types: HashMap<String, i64>,
-    tool_metrics: HashMap<String, ToolMetricAccumulator>,
-    search_terms: HashMap<String, i64>,
-    search_hours: [i64; 24],
-    project_compactions: HashMap<String, i64>,
+    mut analytics: TurnAnalytics,
     selected_project: Option<&str>,
     session_cwds: &HashMap<String, Option<String>>,
+    session_project_labels: &HashMap<String, String>,
 ) -> anyhow::Result<TurnAnalytics> {
-    let mut analytics = TurnAnalytics {
-        context_compactions,
-        rolled_back_turns,
-        interruption_timeline,
-        tool_types,
-        tool_metrics,
-        search_terms,
-        search_hours,
-        project_compactions,
-        ..Default::default()
-    };
     let mut filtered_turns = all_turns
         .into_iter()
         .filter(|turn| {
@@ -2439,7 +2951,21 @@ fn summarize_turns(
                     .get(&turn.session_id)
                     .and_then(|value| value.as_deref())
             });
-            matches_project_filter(cwd, selected_project)
+            let label = turn
+                .cwd
+                .as_deref()
+                .map(|cwd| {
+                    project_label_for_context(
+                        Some(cwd),
+                        session_project_labels
+                            .get(&turn.session_id)
+                            .map(String::as_str),
+                        None,
+                    )
+                })
+                .or_else(|| session_project_labels.get(&turn.session_id).cloned())
+                .unwrap_or_else(|| project_label_from_option(cwd));
+            matches_project_filter_label(&label, selected_project)
         })
         .collect::<Vec<_>>();
 
@@ -2501,7 +3027,13 @@ fn summarize_turns(
         }
         if let Some(current_cwd) = effective_cwd.filter(|value| !value.trim().is_empty()) {
             let normalized = normalize_workspace(&current_cwd);
-            let current_project = project_key(&normalized);
+            let current_project = project_label_for_context(
+                Some(&current_cwd),
+                session_project_labels
+                    .get(&turn.session_id)
+                    .map(String::as_str),
+                None,
+            );
             if previous_cwd
                 .as_deref()
                 .is_some_and(|previous| previous != normalized)
@@ -2558,10 +3090,135 @@ fn tool_label(inner_type: Option<&str>, payload: &JsonValue) -> String {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| "tool_call".to_string()),
         Some("web_search_call") => "web_search".to_string(),
+        Some("tool_search_call") | Some("tool_search_output") => "tool_search".to_string(),
+        Some("image_generation_call") | Some("image_generation_end") => {
+            "image_generation".to_string()
+        }
         Some("view_image_tool_call") => "view_image".to_string(),
         Some(other) => other.to_string(),
         None => "tool_call".to_string(),
     }
+}
+
+fn mcp_tool_label(payload: &JsonValue) -> String {
+    let tool = payload.get("tool").and_then(JsonValue::as_str).or_else(|| {
+        payload
+            .get("invocation")
+            .and_then(|value| value.get("tool"))
+            .and_then(JsonValue::as_str)
+    });
+    let server = payload
+        .get("server")
+        .and_then(JsonValue::as_str)
+        .or_else(|| {
+            payload
+                .get("invocation")
+                .and_then(|value| value.get("server"))
+                .and_then(JsonValue::as_str)
+        });
+
+    match (server, tool) {
+        (Some(server), Some(tool)) if !server.trim().is_empty() && !tool.trim().is_empty() => {
+            format!("{server}.{tool}")
+        }
+        (_, Some(tool)) if !tool.trim().is_empty() => tool.to_string(),
+        _ => "mcp_tool".to_string(),
+    }
+}
+
+fn mcp_tool_duration_seconds(payload: &JsonValue) -> Option<f64> {
+    payload
+        .get("duration_sec")
+        .and_then(JsonValue::as_f64)
+        .or_else(|| {
+            let duration = payload.get("duration")?;
+            if let Some(seconds) = duration.as_f64() {
+                return Some(seconds);
+            }
+            if duration.get("secs").is_none() && duration.get("nanos").is_none() {
+                return None;
+            }
+            let secs = duration
+                .get("secs")
+                .and_then(JsonValue::as_f64)
+                .unwrap_or(0.0);
+            let nanos = duration
+                .get("nanos")
+                .and_then(JsonValue::as_f64)
+                .unwrap_or(0.0);
+            Some(secs + nanos / 1_000_000_000.0)
+        })
+}
+
+fn mcp_tool_is_error(payload: &JsonValue) -> bool {
+    payload
+        .get("is_error")
+        .and_then(JsonValue::as_bool)
+        .or_else(|| {
+            payload
+                .get("result")
+                .and_then(|value| value.get("Ok"))
+                .and_then(|value| value.get("isError"))
+                .and_then(JsonValue::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn completed_item_tool_label(item: &JsonValue) -> Option<String> {
+    match item.get("type").and_then(JsonValue::as_str)? {
+        "CommandExecution" => Some("exec_command".to_string()),
+        "FileChange" => Some("apply_patch".to_string()),
+        "ImageView" => Some("view_image".to_string()),
+        "McpToolCall" => Some(mcp_tool_label(item)),
+        "Extension" => item
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(|kind| match kind {
+                "web.search" => "web_search".to_string(),
+                "tool.search" => "tool_search".to_string(),
+                other => other.to_string(),
+            })
+            .or_else(|| Some("extension".to_string())),
+        _ => None,
+    }
+}
+
+fn completed_item_failed(item: &JsonValue) -> bool {
+    let failed_status = item
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|status| {
+            matches!(
+                status.to_ascii_lowercase().as_str(),
+                "failed" | "error" | "cancelled" | "canceled"
+            )
+        });
+    failed_status
+        || item
+            .get("exit_code")
+            .and_then(JsonValue::as_i64)
+            .is_some_and(|exit_code| exit_code != 0)
+}
+
+fn completed_item_duration_seconds(payload: &JsonValue, item: &JsonValue) -> Option<f64> {
+    mcp_tool_duration_seconds(item).or_else(|| {
+        let started = payload.get("started_at_ms")?.as_i64()?;
+        let completed = payload.get("completed_at_ms")?.as_i64()?;
+        Some((completed.saturating_sub(started)) as f64 / 1000.0)
+    })
+}
+
+fn image_generation_outcome(payload: &JsonValue) -> Option<bool> {
+    payload
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .map(|status| match status.to_ascii_lowercase().as_str() {
+            "failed" | "error" | "cancelled" | "canceled" => Some(false),
+            "generating" | "queued" | "in_progress" => None,
+            _ => Some(true),
+        })
+        .unwrap_or(Some(true))
 }
 
 fn build_log_analytics(
@@ -2609,7 +3266,8 @@ fn build_log_analytics(
         let lower_body = body.to_ascii_lowercase();
         if let Some(project) = selected_project {
             let log_cwd = extract_cwd_from_log(&body);
-            if !matches_project_filter(log_cwd.as_deref(), Some(project)) {
+            let log_project = project_label_for_context(log_cwd.as_deref(), None, None);
+            if !matches_project_filter_label(&log_project, Some(project)) {
                 continue;
             }
         }
@@ -2760,12 +3418,22 @@ fn bucket_label_for_timestamp(timestamp: DateTime<Utc>, granularity: TimeGranula
 fn extract_search_queries(payload: &JsonValue) -> Vec<String> {
     let mut queries = Vec::new();
     if let Some(query) = payload
+        .get("query")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        queries.push(query.trim().to_string());
+    }
+    if let Some(query) = payload
         .get("action")
         .and_then(|value| value.get("query"))
         .and_then(JsonValue::as_str)
         .filter(|value| !value.trim().is_empty())
     {
-        queries.push(query.trim().to_string());
+        let query = query.trim().to_string();
+        if !queries.contains(&query) {
+            queries.push(query);
+        }
     }
     if let Some(items) = payload
         .get("action")
@@ -2774,7 +3442,10 @@ fn extract_search_queries(payload: &JsonValue) -> Vec<String> {
     {
         for item in items {
             if let Some(query) = item.as_str().filter(|value| !value.trim().is_empty()) {
-                queries.push(query.trim().to_string());
+                let query = query.trim().to_string();
+                if !queries.contains(&query) {
+                    queries.push(query);
+                }
             }
         }
     }
@@ -2785,9 +3456,24 @@ fn extract_last_token_usage(payload: &JsonValue) -> Option<TokenUsageAccumulator
     let usage = payload
         .get("info")
         .and_then(|value| value.get("last_token_usage"))?;
+    extract_token_usage(usage)
+}
+
+fn extract_token_usage_record(payload: &JsonValue) -> Option<TokenUsageAccumulator> {
+    extract_token_usage(payload.get("usage")?)
+}
+
+fn extract_token_usage(usage: &JsonValue) -> Option<TokenUsageAccumulator> {
+    if !usage.is_object() {
+        return None;
+    }
     Some(TokenUsageAccumulator {
         cached_input_tokens: usage
             .get("cached_input_tokens")
+            .and_then(JsonValue::as_i64)
+            .unwrap_or_default(),
+        cache_write_input_tokens: usage
+            .get("cache_write_input_tokens")
             .and_then(JsonValue::as_i64)
             .unwrap_or_default(),
         input_tokens: usage
@@ -2809,12 +3495,21 @@ fn extract_last_token_usage(payload: &JsonValue) -> Option<TokenUsageAccumulator
     })
 }
 
+fn apply_token_usage(turn: &mut TurnRecord, usage: &TokenUsageAccumulator) {
+    turn.cached_input_tokens += usage.cached_input_tokens;
+    turn.cache_write_input_tokens += usage.cache_write_input_tokens;
+    turn.input_tokens += usage.input_tokens;
+    turn.output_tokens += usage.output_tokens;
+    turn.reasoning_output_tokens += usage.reasoning_output_tokens;
+    turn.total_tokens += usage.total_tokens;
+}
+
 fn extract_cwd_from_log(body: &str) -> Option<String> {
     let marker = "cwd=";
     let start = body.find(marker)? + marker.len();
     let tail = &body[start..];
     let end = tail
-        .find(|ch: char| matches!(ch, '}' | ',' | ')' | '"' | '\'' | '\n' | '\r'))
+        .find(['}', ',', ')', '"', '\'', '\n', '\r'])
         .unwrap_or(tail.len());
     let value = tail[..end].trim();
     if value.is_empty() {
@@ -2829,10 +3524,10 @@ fn apply_tool_result(
     exit_code: Option<i64>,
     duration_sec: Option<f64>,
 ) {
-    if exit_code.unwrap_or(0) == 0 {
-        metric.success += 1;
-    } else {
-        metric.failure += 1;
+    match exit_code {
+        Some(0) => metric.success += 1,
+        Some(_) => metric.failure += 1,
+        None => {}
     }
     if let Some(duration) = duration_sec.filter(|value| *value >= 0.0) {
         metric.duration_total_sec += duration;
@@ -2845,12 +3540,21 @@ fn parse_function_call_exit_code(output: &str) -> Option<i64> {
         .lines()
         .find_map(|line| line.strip_prefix("Exit code:"))
         .and_then(|value| value.trim().parse::<i64>().ok())
+        .or_else(|| {
+            output
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Process exited with code "))
+                .and_then(|value| value.trim().parse::<i64>().ok())
+        })
 }
 
 fn parse_wall_time_seconds(output: &str) -> Option<f64> {
     let value = output
         .lines()
-        .find_map(|line| line.strip_prefix("Wall time:"))?
+        .find_map(|line| {
+            line.strip_prefix("Wall time:")
+                .or_else(|| line.strip_prefix("Wall time "))
+        })?
         .trim();
     let numeric = value
         .split_whitespace()
@@ -2864,28 +3568,65 @@ fn parse_wall_time_seconds(output: &str) -> Option<f64> {
 }
 
 fn parse_custom_tool_output(output: Option<&JsonValue>) -> (Option<i64>, Option<f64>) {
-    let Some(raw) = output.and_then(JsonValue::as_str) else {
-        return (None, None);
-    };
-    let Ok(parsed) = serde_json::from_str::<JsonValue>(raw) else {
-        return (None, None);
-    };
-    let exit_code = parsed
-        .get("metadata")
-        .and_then(|value| value.get("exit_code"))
-        .and_then(JsonValue::as_i64);
-    let duration_sec = parsed
-        .get("metadata")
-        .and_then(|value| value.get("duration_seconds"))
-        .and_then(JsonValue::as_f64)
-        .or_else(|| {
-            parsed
-                .get("metadata")
-                .and_then(|value| value.get("duration_seconds"))
-                .and_then(JsonValue::as_i64)
-                .map(|value| value as f64)
-        });
+    parse_tool_output(output)
+}
+
+fn parse_tool_output(output: Option<&JsonValue>) -> (Option<i64>, Option<f64>) {
+    let mut exit_code = None;
+    let mut duration_sec = None;
+    if let Some(output) = output {
+        collect_tool_output_metrics(output, &mut exit_code, &mut duration_sec);
+    }
     (exit_code, duration_sec)
+}
+
+fn collect_tool_output_metrics(
+    value: &JsonValue,
+    exit_code: &mut Option<i64>,
+    duration_sec: &mut Option<f64>,
+) {
+    match value {
+        JsonValue::String(text) => {
+            if exit_code.is_none() {
+                *exit_code = parse_function_call_exit_code(text);
+            }
+            if duration_sec.is_none() {
+                *duration_sec = parse_wall_time_seconds(text);
+            }
+            let trimmed = text.trim_start();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if let Ok(parsed) = serde_json::from_str::<JsonValue>(text) {
+                    collect_tool_output_metrics(&parsed, exit_code, duration_sec);
+                }
+            }
+        }
+        JsonValue::Array(items) => {
+            for item in items {
+                collect_tool_output_metrics(item, exit_code, duration_sec);
+            }
+        }
+        JsonValue::Object(map) => {
+            if exit_code.is_none() {
+                *exit_code = map
+                    .get("exit_code")
+                    .or_else(|| map.get("exitCode"))
+                    .and_then(JsonValue::as_i64);
+            }
+            if duration_sec.is_none() {
+                *duration_sec = map
+                    .get("duration_seconds")
+                    .or_else(|| map.get("durationSeconds"))
+                    .and_then(JsonValue::as_f64)
+                    .or_else(|| mcp_tool_duration_seconds(value));
+            }
+            for key in ["metadata", "structuredContent", "text", "output", "content"] {
+                if let Some(nested) = map.get(key) {
+                    collect_tool_output_metrics(nested, exit_code, duration_sec);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn contains_code_hint(text: &str) -> bool {
@@ -2929,6 +3670,30 @@ fn normalize_workspace(value: &str) -> String {
     value.trim().replace('\\', "/").to_ascii_lowercase()
 }
 
+fn is_codex_conversation_workspace(value: &str) -> bool {
+    let normalized = normalize_workspace(value);
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    parts.windows(3).any(|window| {
+        window[0] == "documents" && window[1] == "codex" && is_iso_date_segment(window[2])
+    })
+}
+
+fn is_iso_date_segment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+#[cfg(test)]
 fn project_key(value: &str) -> String {
     last_path_component(value)
         .map(|item| item.to_ascii_lowercase())
@@ -2936,15 +3701,13 @@ fn project_key(value: &str) -> String {
 }
 
 fn last_path_component(value: &str) -> Option<&str> {
-    let trimmed = value
-        .trim()
-        .trim_end_matches(|character| matches!(character, '/' | '\\'));
+    let trimmed = value.trim().trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
         return None;
     }
 
     trimmed
-        .rsplit(|character| matches!(character, '/' | '\\'))
+        .rsplit(['/', '\\'])
         .find(|item| !item.trim().is_empty())
 }
 
@@ -3101,7 +3864,190 @@ fn read_json_file(path: &std::path::Path) -> Option<JsonValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{last_path_component, normalize_workspace, project_key, project_label_from_cwd};
+    use super::{
+        completed_item_duration_seconds, completed_item_failed, completed_item_tool_label,
+        extract_token_usage_record, is_codex_conversation_workspace, last_path_component,
+        load_session_snapshots, normalize_workspace, parse_custom_tool_output, parse_tool_output,
+        project_key, project_label_for_context, project_label_from_cwd, RangePreset,
+        ResolvedDashboardScope, TimeGranularity,
+    };
+    use chrono::NaiveDate;
+    use rusqlite::{params, Connection};
+    use serde_json::json;
+
+    #[test]
+    fn reads_metrics_from_array_tool_outputs() {
+        let output = json!([
+            {"type": "input_text", "text": "Script completed\nWall time 125 milliseconds\nOutput:\n"},
+            {"type": "input_text", "text": "Process exited with code 0"}
+        ]);
+
+        assert_eq!(parse_tool_output(Some(&output)), (Some(0), Some(0.125)));
+    }
+
+    #[test]
+    fn reads_metrics_from_json_encoded_custom_outputs() {
+        let output = json!(r#"{"metadata":{"exit_code":7,"duration_seconds":1.5}}"#);
+
+        assert_eq!(
+            parse_custom_tool_output(Some(&output)),
+            (Some(7), Some(1.5))
+        );
+    }
+
+    #[test]
+    fn maps_completed_items_to_current_tool_metrics() {
+        let payload = json!({
+            "started_at_ms": 1000,
+            "completed_at_ms": 2500
+        });
+        let command = json!({
+            "type": "CommandExecution",
+            "status": "failed",
+            "exit_code": 1
+        });
+        let extension = json!({"type": "Extension", "kind": "web.search"});
+
+        assert_eq!(
+            completed_item_tool_label(&command).as_deref(),
+            Some("exec_command")
+        );
+        assert_eq!(
+            completed_item_tool_label(&extension).as_deref(),
+            Some("web_search")
+        );
+        assert!(completed_item_failed(&command));
+        assert_eq!(
+            completed_item_duration_seconds(&payload, &command),
+            Some(1.5)
+        );
+    }
+
+    #[test]
+    fn reads_current_token_usage_record_fields() {
+        let payload = json!({
+            "usage": {
+                "input_tokens": 100,
+                "cached_input_tokens": 40,
+                "cache_write_input_tokens": 12,
+                "output_tokens": 20,
+                "reasoning_output_tokens": 7,
+                "total_tokens": 120
+            }
+        });
+
+        let usage = extract_token_usage_record(&payload).expect("usage should parse");
+
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.cached_input_tokens, 40);
+        assert_eq!(usage.cache_write_input_tokens, 12);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_output_tokens, 7);
+        assert_eq!(usage.total_tokens, 120);
+    }
+
+    #[test]
+    fn current_token_records_replace_legacy_counts_without_double_counting() {
+        let conn = Connection::open_in_memory().expect("in-memory database should open");
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .expect("schema should initialize");
+        conn.execute(
+            "INSERT INTO sessions (
+                id, updated_at, raw_event_count, user_message_count, assistant_message_count,
+                tool_call_count, turn_count, duration_sec, warning_count, warnings_json
+             ) VALUES ('session', '2026-09-04T10:00:00Z', 5, 1, 1, 0, 1, 1, 0, '[]')",
+            [],
+        )
+        .expect("session should insert");
+        let events = [
+            (
+                "event-1",
+                1,
+                "event_msg",
+                Some("thread_settings_applied"),
+                json!({
+                    "type": "thread_settings_applied",
+                    "thread_settings": {"model": "gpt-5.5", "reasoning_effort": "high"}
+                }),
+            ),
+            (
+                "event-2",
+                2,
+                "event_msg",
+                Some("task_started"),
+                json!({"type": "task_started", "turn_id": "turn-1"}),
+            ),
+            (
+                "event-3",
+                3,
+                "event_msg",
+                Some("token_count"),
+                json!({
+                    "type": "token_count",
+                    "info": {"last_token_usage": {"input_tokens": 1, "total_tokens": 1}}
+                }),
+            ),
+            (
+                "event-4",
+                4,
+                "token_usage_record",
+                None,
+                json!({
+                    "type": "token_usage_record",
+                    "turn_id": "turn-1",
+                    "response_id": "resp-1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "cached_input_tokens": 40,
+                        "cache_write_input_tokens": 12,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 7,
+                        "total_tokens": 120
+                    }
+                }),
+            ),
+            (
+                "event-5",
+                5,
+                "token_usage_record",
+                None,
+                json!({
+                    "type": "token_usage_record",
+                    "turn_id": "turn-1",
+                    "response_id": "resp-1",
+                    "usage": {"input_tokens": 100, "total_tokens": 120}
+                }),
+            ),
+        ];
+        for (id, seq, outer_type, inner_type, payload) in events {
+            conn.execute(
+                "INSERT INTO session_events_raw (
+                    id, session_id, seq, ts, outer_type, inner_type, payload_json
+                 ) VALUES (?1, 'session', ?2, '2026-09-04T10:00:00Z', ?3, ?4, ?5)",
+                params![id, seq, outer_type, inner_type, payload.to_string()],
+            )
+            .expect("event should insert");
+        }
+        let date = NaiveDate::from_ymd_opt(2026, 9, 4).expect("valid date");
+        let scope = ResolvedDashboardScope {
+            preset: RangePreset::Custom,
+            granularity: TimeGranularity::Day,
+            start: date,
+            end: date,
+            available_start: Some(date),
+            available_end: Some(date),
+        };
+        let sessions = load_session_snapshots(&conn, &scope, None).expect("sessions should load");
+        let analytics = super::build_turn_analytics(&conn, &scope, None, &sessions)
+            .expect("analytics should build");
+        let turn = analytics.turns.first().expect("turn should exist");
+
+        assert_eq!(turn.total_tokens, 120);
+        assert_eq!(turn.input_tokens, 100);
+        assert_eq!(turn.cache_write_input_tokens, 12);
+        assert_eq!(turn.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(turn.effort.as_deref(), Some("high"));
+    }
 
     #[test]
     fn extracts_project_names_from_windows_and_unix_paths() {
@@ -3127,6 +4073,45 @@ mod tests {
         );
         assert_eq!(project_key("d:/codes/rescue_codex"), "rescue_codex");
         assert_eq!(project_key(r"d:\codes\rescue_codex"), "rescue_codex");
+    }
+
+    #[test]
+    fn labels_real_project_workspaces_by_folder_name() {
+        assert_eq!(
+            project_label_for_context(
+                Some("/Users/tian/Codes/soulmate"),
+                Some("A renamed conversation"),
+                Some("fallback"),
+            ),
+            "soulmate"
+        );
+    }
+
+    #[test]
+    fn labels_codex_conversation_workspaces_by_thread_title() {
+        assert!(is_codex_conversation_workspace(
+            "/Users/tian/Documents/Codex/2026-07-06/ban"
+        ));
+        assert_eq!(
+            project_label_for_context(
+                Some("/Users/tian/Documents/Codex/2026-07-06/ban"),
+                Some("安装 Leonxlnx/taste-skill"),
+                Some("fallback"),
+            ),
+            "安装 Leonxlnx/taste-skill"
+        );
+    }
+
+    #[test]
+    fn falls_back_for_untitled_codex_conversations() {
+        assert_eq!(
+            project_label_for_context(
+                Some("/Users/tian/Documents/Codex/2026-07-07/anz"),
+                None,
+                Some("安装这个 skill"),
+            ),
+            "安装这个 skill"
+        );
     }
 }
 

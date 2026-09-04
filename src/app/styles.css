@@ -1816,6 +1816,29 @@ textarea {
   width: 100%;
 }
 
+.session-message-image.is-loading,
+.session-message-image.is-failed {
+  align-items: center;
+  color: var(--rc-muted);
+  cursor: default;
+  display: inline-flex;
+  justify-content: center;
+}
+
+.session-message-image.is-loading svg {
+  animation: session-image-pulse 1.2s ease-in-out infinite;
+}
+
+.session-message-image.is-failed {
+  opacity: 0.55;
+}
+
+@keyframes session-image-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
 .session-image-lightbox {
   align-items: center;
   background: rgba(0, 0, 0, 0.66);
@@ -1940,6 +1963,11 @@ textarea {
   padding: 0.1rem 0.95rem 0.85rem;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+.session-process-message__details .session-message-images {
+  justify-content: flex-start;
+  margin: 0 0.95rem 0.85rem;
 }
 
 .session-tool-badge {

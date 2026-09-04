@@ -82,6 +82,7 @@ export type TokenUsageSummary = {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
   reasoningOutputTokens: number;
   totalTokens: number;
 };
@@ -95,6 +96,7 @@ export type RankedTurnRecord = {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  cacheWriteInputTokens: number;
   reasoningOutputTokens: number;
   firstResponseSec?: number | null;
   completionSec?: number | null;
@@ -204,6 +206,14 @@ export type SessionMessage = {
   phase?: string | null;
   imageUrls?: string[];
   image_urls?: string[];
+  media?: SessionMediaRef[];
+};
+
+export type SessionMediaRef = {
+  id?: string | null;
+  kind: string;
+  mimeType?: string | null;
+  url?: string | null;
 };
 
 export type SessionDetail = {

@@ -89,6 +89,7 @@ pub struct TokenUsageSummary {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: i64,
     pub reasoning_output_tokens: i64,
     pub total_tokens: i64,
 }
@@ -104,6 +105,7 @@ pub struct RankedTurnRecord {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cached_input_tokens: i64,
+    pub cache_write_input_tokens: i64,
     pub reasoning_output_tokens: i64,
     pub first_response_sec: Option<i64>,
     pub completion_sec: Option<i64>,
@@ -230,6 +232,16 @@ pub struct SessionMessageRecord {
     pub tool_name: Option<String>,
     pub phase: Option<String>,
     pub image_urls: Vec<String>,
+    pub media: Vec<SessionMediaRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMediaRef {
+    pub id: Option<String>,
+    pub kind: String,
+    pub mime_type: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -333,18 +345,13 @@ pub struct ImportRunResult {
     pub issues: Vec<ImportIssueRecord>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
     Csv,
+    #[default]
     Json,
     Markdown,
-}
-
-impl Default for ExportFormat {
-    fn default() -> Self {
-        Self::Json
-    }
 }
 
 impl ExportFormat {
@@ -357,17 +364,12 @@ impl ExportFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportKind {
+    #[default]
     Dashboard,
     Sessions,
-}
-
-impl Default for ExportKind {
-    fn default() -> Self {
-        Self::Dashboard
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -23,7 +23,24 @@ function normalizeText(text?: string | null) {
 }
 
 function messageImageCount(message: SessionMessage) {
-  return Math.max(message.imageUrls?.length ?? 0, message.image_urls?.length ?? 0);
+  return Math.max(message.imageUrls?.length ?? 0, message.image_urls?.length ?? 0, message.media?.length ?? 0);
+}
+
+function mergeMessageImages(existing: SessionMessage, incoming: SessionMessage) {
+  const media = [...(existing.media ?? [])];
+  const mediaKeys = new Set(media.map((item) => item.id || item.url).filter(Boolean));
+  for (const item of incoming.media ?? []) {
+    const key = item.id || item.url;
+    if (!key || !mediaKeys.has(key)) {
+      media.push(item);
+      if (key) {
+        mediaKeys.add(key);
+      }
+    }
+  }
+  const imageUrls = [...new Set([...(existing.imageUrls ?? []), ...(incoming.imageUrls ?? [])])];
+  const image_urls = [...new Set([...(existing.image_urls ?? []), ...(incoming.image_urls ?? [])])];
+  return { ...existing, media, imageUrls, image_urls };
 }
 
 function parseTimestamp(value?: string | null) {
@@ -76,8 +93,8 @@ export function dedupeVisibleMessages(messages: SessionMessage[]) {
       const existing = output[duplicate.outputIndex];
       const existingImageCount = messageImageCount(existing);
       const currentImageCount = messageImageCount(message);
-      if (currentImageCount > existingImageCount) {
-        output[duplicate.outputIndex] = message;
+      if (existingImageCount > 0 || currentImageCount > 0) {
+        output[duplicate.outputIndex] = mergeMessageImages(existing, message);
       }
       continue;
     }

@@ -118,6 +118,7 @@ impl SourceParser for GenericJsonParser {
                         tool_name: None,
                         phase: None,
                         meta_json: compact_json_string(&value),
+                        media: Vec::new(),
                     });
                 }
             }

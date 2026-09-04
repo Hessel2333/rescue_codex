@@ -9,11 +9,7 @@ pub struct SessionIndexEntry {
 
 #[derive(Debug, Clone)]
 pub struct ParseContext {
-    pub source_id: String,
-    pub import_id: String,
     pub abs_path: PathBuf,
-    pub rel_path: Option<PathBuf>,
-    pub file_size: u64,
     pub mtime_ms: i64,
     pub fingerprint: String,
     pub session_index: Arc<HashMap<String, SessionIndexEntry>>,
@@ -22,7 +18,6 @@ pub struct ParseContext {
 #[derive(Debug, Clone)]
 pub struct ParserTarget {
     pub abs_path: PathBuf,
-    pub rel_path: Option<PathBuf>,
     pub extension: String,
     pub sample: String,
 }
@@ -82,6 +77,15 @@ pub struct ParsedMessage {
     pub tool_name: Option<String>,
     pub phase: Option<String>,
     pub meta_json: String,
+    pub media: Vec<ParsedMedia>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ParsedMedia {
+    pub kind: String,
+    pub mime_type: Option<String>,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

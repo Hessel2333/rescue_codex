@@ -1,4 +1,4 @@
-import { ComponentType, ReactNode, useMemo, useRef, useState } from "react";
+import { ComponentType, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -16,6 +16,7 @@ import clsx from "clsx";
 import { Panel } from "../../components/Panel";
 import { formatDateTime, formatDuration, formatOptionalText } from "../../lib/format";
 import { dedupeVisibleMessages, isVisibleConversationMessage } from "../../lib/sessionVisibility";
+import { loadSessionMedia } from "../../lib/tauri";
 import { SessionDetail, SessionMessage } from "../../types/api";
 
 type SessionDetailPanelProps = {
@@ -102,16 +103,22 @@ function processDurationSec(messages: SessionMessage[]) {
 function toolConfig(message: SessionMessage): ToolConfig {
   const raw = `${message.toolName ?? ""} ${message.kind} ${message.text ?? ""}`.toLowerCase();
 
+  if (raw.includes("node_repl") || raw.includes("exec_command") || raw.includes("terminal")) {
+    return { tone: "shell", label: message.toolName || "Terminal", Icon: Terminal };
+  }
+  if (raw.includes("sub_agent") || raw.includes("agent")) {
+    return { tone: "generic", label: message.toolName || "Sub-agent", Icon: Wrench };
+  }
   if (raw.includes("shell") || raw.includes("command") || raw.includes("powershell") || raw.includes("bash")) {
     return { tone: "shell", label: message.toolName || "Shell", Icon: Terminal };
   }
-  if (raw.includes("search") || raw.includes("web")) {
+  if (raw.includes("tool_search") || raw.includes("search") || raw.includes("web")) {
     return { tone: "search", label: message.toolName || "Search", Icon: Search };
   }
   if (raw.includes("file") || raw.includes("fs") || raw.includes("read") || raw.includes("write")) {
     return { tone: "file", label: message.toolName || "File", Icon: FileText };
   }
-  if (raw.includes("image") || raw.includes("screenshot")) {
+  if (raw.includes("image_generation") || raw.includes("image") || raw.includes("screenshot")) {
     return { tone: "image", label: message.toolName || "Image", Icon: ImageIcon };
   }
   if (raw.includes("sqlite") || raw.includes("database") || raw.includes("query")) {
@@ -147,8 +154,36 @@ function stripImagePlaceholders(text?: string | null) {
   return (text ?? "").replace(/<image>[\s\S]*?<\/image>/gi, "").trimEnd();
 }
 
-function messageImageUrls(message: SessionMessage) {
-  return message.imageUrls?.length ? message.imageUrls : message.image_urls ?? [];
+type MessageImageSource = {
+  key: string;
+  mediaId?: string;
+  url?: string;
+};
+
+function messageImageSources(message: SessionMessage) {
+  const sources: MessageImageSource[] = [];
+  const seen = new Set<string>();
+  for (const media of message.media ?? []) {
+    if (media.kind !== "image") {
+      continue;
+    }
+    const mediaId = media.id ?? undefined;
+    const url = media.url ?? undefined;
+    const key = mediaId ? `id:${mediaId}` : url ? `url:${url}` : "";
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      sources.push({ key, mediaId, url });
+    }
+  }
+  const legacyUrls = message.imageUrls?.length ? message.imageUrls : message.image_urls ?? [];
+  for (const url of legacyUrls) {
+    const key = `url:${url}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      sources.push({ key, url });
+    }
+  }
+  return sources;
 }
 
 function codeBlockTone(language: string) {
@@ -346,7 +381,7 @@ function MessageBubble({ message }: { message: SessionMessage }) {
   const role = roleOf(message) || "unknown";
   const isUser = role === "user";
   const isAssistant = role === "assistant";
-  const imageUrls = messageImageUrls(message);
+  const imageSources = messageImageSources(message);
   const text = stripImagePlaceholders(message.text);
 
   return (
@@ -356,28 +391,69 @@ function MessageBubble({ message }: { message: SessionMessage }) {
         <span>{message.kind}</span>
         <span>{formatDateTime(message.ts)}</span>
       </div>
-      {imageUrls.length > 0 ? <MessageImages urls={imageUrls} /> : null}
-      {text.trim() || imageUrls.length === 0 ? <RichMessageText text={text} /> : null}
+      {imageSources.length > 0 ? <MessageImages sources={imageSources} /> : null}
+      {text.trim() || imageSources.length === 0 ? <RichMessageText text={text} /> : null}
     </article>
   );
 }
 
-function MessageImages({ urls }: { urls: string[] }) {
+function MessageImage({
+  source,
+  index,
+  onOpen,
+}: {
+  source: MessageImageSource;
+  index: number;
+  onOpen: (url: string) => void;
+}) {
+  const [url, setUrl] = useState(source.url ?? null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (source.url || !source.mediaId) {
+      setUrl(source.url ?? null);
+      setFailed(!source.url);
+      return;
+    }
+    let active = true;
+    setFailed(false);
+    loadSessionMedia(source.mediaId)
+      .then((value) => {
+        if (active) {
+          setUrl(value);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setFailed(true);
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [source.mediaId, source.url]);
+
+  return (
+    <button
+      type="button"
+      className={clsx("session-message-image", !url && "is-loading", failed && "is-failed")}
+      onClick={() => url && onOpen(url)}
+      disabled={!url}
+      aria-label={failed ? `图片 ${index + 1} 不可用` : `放大查看图片 ${index + 1}`}
+    >
+      {url ? <img src={url} alt={`会话图片 ${index + 1}`} loading="lazy" /> : <ImageIcon className="h-5 w-5" />}
+    </button>
+  );
+}
+
+function MessageImages({ sources }: { sources: MessageImageSource[] }) {
   const [activeUrl, setActiveUrl] = useState<string | null>(null);
 
   return (
     <>
       <div className="session-message-images">
-        {urls.map((url, index) => (
-          <button
-            key={`${url.slice(0, 80)}-${index}`}
-            type="button"
-            className="session-message-image"
-            onClick={() => setActiveUrl(url)}
-            aria-label={`放大查看图片 ${index + 1}`}
-          >
-            <img src={url} alt={`会话图片 ${index + 1}`} loading="lazy" />
-          </button>
+        {sources.map((source, index) => (
+          <MessageImage key={source.key} source={source} index={index} onOpen={setActiveUrl} />
         ))}
       </div>
 
@@ -394,9 +470,11 @@ function MessageImages({ urls }: { urls: string[] }) {
 }
 
 function ProcessTextMessage({ message }: { message: SessionMessage }) {
+  const imageSources = messageImageSources(message);
   return (
     <div className="session-process-text">
-      <RichMessageText text={message.text} />
+      {message.text || imageSources.length === 0 ? <RichMessageText text={message.text} /> : null}
+      {imageSources.length > 0 ? <MessageImages sources={imageSources} /> : null}
     </div>
   );
 }
@@ -405,6 +483,8 @@ function ProcessMessage({ message }: { message: SessionMessage }) {
   const [expanded, setExpanded] = useState(false);
   const config = toolConfig(message);
   const preview = toolPreview(message);
+  const imageSources = messageImageSources(message);
+  const hasDetails = Boolean(message.text || imageSources.length > 0);
 
   return (
     <div className={clsx("session-process-message", `tool-tone-${config.tone}`)}>
@@ -417,7 +497,12 @@ function ProcessMessage({ message }: { message: SessionMessage }) {
         <span className="session-process-message__kind">{message.kind}</span>
         <span className="session-process-message__preview">{preview}</span>
       </button>
-      {expanded && message.text ? <pre className="session-process-message__text">{message.text}</pre> : null}
+      {expanded && hasDetails ? (
+        <div className="session-process-message__details">
+          {message.text ? <pre className="session-process-message__text">{message.text}</pre> : null}
+          {imageSources.length > 0 ? <MessageImages sources={imageSources} /> : null}
+        </div>
+      ) : null}
     </div>
   );
 }

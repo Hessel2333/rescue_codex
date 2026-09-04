@@ -161,30 +161,48 @@ pub fn finalize_session(
 }
 
 pub fn dedupe_messages(messages: &mut Vec<ParsedMessage>) {
-    let mut seen = HashMap::<String, Vec<Option<i64>>>::new();
-    messages.retain(|message| {
+    let mut seen = HashMap::<String, Vec<(Option<i64>, usize)>>::new();
+    let mut output = Vec::<ParsedMessage>::with_capacity(messages.len());
+    for mut message in messages.drain(..) {
+        let is_user_message = message.role.as_deref() == Some("user") && message.kind == "message";
         let key = format!(
             "{}|{}|{}|{}|{}|{}",
             message.role.clone().unwrap_or_default(),
             message.kind,
-            message.turn_id.clone().unwrap_or_default(),
+            if is_user_message {
+                String::new()
+            } else {
+                message.turn_id.clone().unwrap_or_default()
+            },
             message.tool_name.clone().unwrap_or_default(),
             message.phase.clone().unwrap_or_default(),
             message_hash(message.text.as_deref().unwrap_or(""))
         );
         let timestamp = message.ts.as_deref().and_then(timestamp_millis);
-        let timestamps = seen.entry(key).or_default();
-        let is_duplicate = timestamps
+        let matches = seen.entry(key).or_default();
+        let duplicate_index = matches
             .iter()
-            .any(|existing| timestamps_overlap(*existing, timestamp));
+            .find(|(existing, _)| timestamps_overlap(*existing, timestamp))
+            .map(|(_, index)| *index);
 
-        if is_duplicate {
-            false
+        if let Some(index) = duplicate_index {
+            let existing = &mut output[index];
+            for media in message.media.drain(..) {
+                if !existing
+                    .media
+                    .iter()
+                    .any(|current| current.source == media.source)
+                {
+                    existing.media.push(media);
+                }
+            }
         } else {
-            timestamps.push(timestamp);
-            true
+            let index = output.len();
+            output.push(message);
+            matches.push((timestamp, index));
         }
-    });
+    }
+    *messages = output;
 }
 
 pub fn extract_text(value: &Value) -> Option<String> {
@@ -261,6 +279,7 @@ pub fn generic_message_from_value(value: &Value, ts: Option<String>) -> Option<P
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
         meta_json: compact_json_string(value),
+        media: Vec::new(),
     })
 }
 
@@ -336,7 +355,7 @@ fn timestamps_overlap(left: Option<i64>, right: Option<i64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::dedupe_messages;
-    use crate::models::parser::ParsedMessage;
+    use crate::models::parser::{ParsedMedia, ParsedMessage};
 
     fn message(text: &str, ts: Option<&str>) -> ParsedMessage {
         ParsedMessage {
@@ -370,5 +389,30 @@ mod tests {
         dedupe_messages(&mut messages);
 
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn dedupe_messages_merges_media_from_equivalent_user_events() {
+        let mut first = message("same payload", Some("2026-04-23T02:24:45.232Z"));
+        first.role = Some("user".to_string());
+        first.turn_id = Some("turn-1".to_string());
+        first.media.push(ParsedMedia {
+            kind: "image".to_string(),
+            mime_type: None,
+            source: "/missing/original.png".to_string(),
+        });
+        let mut second = message("same payload", Some("2026-04-23T02:24:45.233Z"));
+        second.role = Some("user".to_string());
+        second.media.push(ParsedMedia {
+            kind: "image".to_string(),
+            mime_type: Some("image/png".to_string()),
+            source: "data:image/png;base64,aGVsbG8=".to_string(),
+        });
+        let mut messages = vec![first, second];
+
+        dedupe_messages(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].media.len(), 2);
     }
 }
