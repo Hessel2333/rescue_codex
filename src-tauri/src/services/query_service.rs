@@ -199,6 +199,7 @@ struct TurnRecord {
     first_assistant_ts: Option<DateTime<Utc>>,
     completed_ts: Option<DateTime<Utc>>,
     task_duration_ms: Option<i64>,
+    time_to_first_token_ms: Option<i64>,
     model: Option<String>,
     effort: Option<String>,
     cwd: Option<String>,
@@ -217,7 +218,10 @@ struct TurnRecord {
 
 impl TurnRecord {
     fn first_response_sec(&self) -> Option<i64> {
-        self.user_ts
+        if let Some(ms) = self.time_to_first_token_ms.filter(|ms| *ms >= 0) {
+            return Some(ms / 1000);
+        }
+        self.user_ts.or(self.started_at)
             .zip(self.first_assistant_ts)
             .map(|(start, end)| (end - start).num_seconds().max(0))
     }
@@ -2458,6 +2462,20 @@ fn build_turn_analytics(
                     .map(ToOwned::to_owned)
                     .or(current_session_cwd);
             }
+            ("response_item", Some("message" | "reasoning")) => {
+                let role = if inner_type.as_deref() == Some("reasoning") {
+                    Some("assistant")
+                } else {
+                    payload.get("role").and_then(JsonValue::as_str)
+                };
+                if matches!(role, Some("user" | "assistant")) {
+                    if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                        let turn = ensure_turn(&mut turns, &turn_id);
+                        turn.session_id = session_id.clone();
+                        observe_turn_message(turn, role.unwrap(), payload.get("text").and_then(JsonValue::as_str), timestamp);
+                    }
+                }
+            }
             ("event_msg", Some("user_message")) => {
                 if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
                     let turn = ensure_turn(&mut turns, &turn_id);
@@ -2600,6 +2618,20 @@ fn build_turn_analytics(
                 let Some(item) = payload.get("item") else {
                     continue;
                 };
+                let item_type = item.get("type").and_then(JsonValue::as_str);
+                if matches!(item_type, Some("UserMessage" | "AgentMessage" | "Reasoning")) {
+                    if let Some(turn_id) = resolve_turn_id(&payload, current_turn_id.as_deref()) {
+                        let turn = ensure_turn(&mut turns, &turn_id);
+                        turn.session_id = session_id.clone();
+                        let message_ts = payload.get("started_at_ms")
+                            .and_then(JsonValue::as_i64)
+                            .and_then(DateTime::<Utc>::from_timestamp_millis)
+                            .or(timestamp);
+                        let role = if item_type == Some("UserMessage") { "user" } else { "assistant" };
+                        observe_turn_message(turn, role, item.get("text").and_then(JsonValue::as_str), message_ts);
+                    }
+                    continue;
+                }
                 let Some(label) = completed_item_tool_label(item) else {
                     continue;
                 };
@@ -2616,10 +2648,7 @@ fn build_turn_analytics(
                     metric.duration_samples += 1;
                 }
 
-                if item
-                    .get("kind")
-                    .and_then(JsonValue::as_str)
-                    .is_some_and(|kind| kind == "web.search")
+                if label == "web_search"
                 {
                     if let Some(event_ts) =
                         timestamp.filter(|value| scope.contains_date(to_local_date(*value)))
@@ -2856,6 +2885,11 @@ fn build_turn_analytics(
                         .and_then(JsonValue::as_i64)
                         .and_then(unix_seconds_to_utc)
                         .or(timestamp);
+                    turn.time_to_first_token_ms = payload
+                        .get("time_to_first_token_ms")
+                        .and_then(JsonValue::as_i64)
+                        .filter(|ms| *ms >= 0)
+                        .or(turn.time_to_first_token_ms);
                     turn.task_duration_ms = payload
                         .get("duration_ms")
                         .and_then(JsonValue::as_i64)
@@ -2923,6 +2957,24 @@ fn build_turn_analytics(
         &session_cwds,
         &session_project_labels,
     )
+}
+
+// Multiple protocol representations may describe the same message. Keep one
+// prompt per turn and the earliest observed timestamps rather than counting twice.
+fn observe_turn_message(
+    turn: &mut TurnRecord,
+    role: &str,
+    text: Option<&str>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if role == "user" {
+        turn.user_ts = turn.user_ts.into_iter().chain(timestamp).min();
+        if turn.user_text.is_none() {
+            turn.user_text = text.map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned);
+        }
+    } else if role == "assistant" {
+        turn.first_assistant_ts = turn.first_assistant_ts.into_iter().chain(timestamp).min();
+    }
 }
 
 fn flush_turns(turns: &mut HashMap<String, TurnRecord>, all_turns: &mut Vec<TurnRecord>) {
@@ -3169,6 +3221,7 @@ fn completed_item_tool_label(item: &JsonValue) -> Option<String> {
         "CommandExecution" => Some("exec_command".to_string()),
         "FileChange" => Some("apply_patch".to_string()),
         "ImageView" => Some("view_image".to_string()),
+        "WebSearch" => Some("web_search".to_string()),
         "McpToolCall" => Some(mcp_tool_label(item)),
         "Extension" => item
             .get("kind")
@@ -3874,6 +3927,95 @@ mod tests {
     use chrono::NaiveDate;
     use rusqlite::{params, Connection};
     use serde_json::json;
+
+    // Exercise raw JSONL -> compact stored events -> dashboard analytics together.
+    // This catches fields being discarded before the query layer can use them.
+    fn analytics_from_jsonl(events: Vec<serde_json::Value>) -> super::TurnAnalytics {
+        use crate::models::parser::{ParseContext, ParserTarget};
+        use crate::parsers::{CodexSessionJsonlParser, SourceParser};
+        let path = std::env::temp_dir().join(format!("rescue-format-{}.jsonl", uuid::Uuid::new_v4()));
+        let body = events.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+        std::fs::write(&path, &body).unwrap();
+        let result = CodexSessionJsonlParser.parse(
+            &ParserTarget { abs_path: path.clone(), extension: "jsonl".into(), sample: body },
+            &ParseContext { abs_path: path.clone(), mtime_ms: 0, fingerprint: "test".into(), session_index: Default::default() },
+        );
+        std::fs::remove_file(path).unwrap();
+        let parsed = result.unwrap();
+        assert!(parsed.warnings.is_empty());
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
+        conn.execute("INSERT INTO sessions (id, updated_at) VALUES ('session', '2026-09-30T10:00:30Z')", []).unwrap();
+        for event in parsed.events {
+            conn.execute(
+                "INSERT INTO session_events_raw (id, session_id, seq, ts, outer_type, inner_type, payload_json)
+                 VALUES (?1, 'session', ?2, ?3, ?4, ?5, ?6)",
+                params![event.seq.to_string(), event.seq, event.ts, event.outer_type, event.inner_type, event.payload_json],
+            ).unwrap();
+        }
+        let date = NaiveDate::from_ymd_opt(2026, 9, 30).unwrap();
+        let scope = ResolvedDashboardScope {
+            preset: RangePreset::Custom, granularity: TimeGranularity::Day,
+            start: date, end: date, available_start: Some(date), available_end: Some(date),
+        };
+        let sessions = load_session_snapshots(&conn, &scope, None).unwrap();
+        super::build_turn_analytics(&conn, &scope, None, &sessions).unwrap()
+    }
+
+    #[test]
+    fn message_formats_restore_prompt_response_and_search_analytics() {
+        for format in ["completed", "response", "legacy", "mixed"] {
+            let event = |second: u32, outer: &str, payload: serde_json::Value| json!({
+                "timestamp": format!("2026-09-30T10:00:{second:02}Z"), "type": outer, "payload": payload
+            });
+            let mut events = vec![
+                event(0, "session_meta", json!({"id":"session", "timestamp":"2026-09-30T10:00:00Z"})),
+                event(0, "event_msg", json!({"type":"task_started", "turn_id":"turn"})),
+            ];
+            if format == "response" || format == "mixed" {
+                events.extend([
+                    event(0, "response_item", json!({"type":"message", "role":"developer", "content":[{"type":"input_text", "text":"private instructions"}]})),
+                    event(0, "response_item", json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"<environment_context>private context</environment_context>"}]})),
+                    event(0, "response_item", json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"# AGENTS.md instructions\nPrivate project context"}]})),
+                    event(1, "response_item", json!({"type":"message", "role":"user", "content":[{"type":"input_text", "text":"Check search compatibility"}]})),
+                    event(6, "response_item", json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"Checking"}]})),
+                ]);
+            }
+            if format == "completed" || format == "mixed" {
+                events.extend([
+                    event(1, "event_msg", json!({"type":"item_completed", "turn_id":"turn", "item":{"type":"UserMessage", "content":[{"type":"text", "text":"Check search compatibility"}]}})),
+                    event(6, "event_msg", json!({"type":"item_completed", "turn_id":"turn", "item":{"type":"AgentMessage", "content":[{"type":"text", "text":"Checking"}]}})),
+                ]);
+            }
+            if format == "legacy" || format == "mixed" {
+                events.extend([
+                    event(1, "event_msg", json!({"type":"user_message", "message":"Check search compatibility"})),
+                    event(6, "event_msg", json!({"type":"agent_message", "message":"Checking"})),
+                ]);
+            }
+            // Duplicate wire representation must not double count a completed search.
+            events.extend([
+                event(7, "response_item", json!({"type":"web_search_call", "id":"search-1", "action":{"type":"search", "query":"compatibility"}})),
+                event(8, "event_msg", json!({"type":"item_completed", "turn_id":"turn", "item":{"type":"WebSearch", "id":"search-1", "action":{"type":"search", "query":"compatibility"}}})),
+                event(9, "event_msg", json!({"type":"item_completed", "turn_id":"turn", "item":{"type":"Extension", "kind":"web.search", "id":"search-2", "query":"migration"}})),
+                event(30, "event_msg", json!({"type":"task_complete", "turn_id":"turn", "duration_ms":30000})),
+            ]);
+            let analytics = analytics_from_jsonl(events.clone());
+            assert_eq!(analytics.turns.len(), 1, "{format}");
+            let turn = &analytics.turns[0];
+            assert_eq!(turn.user_text.as_deref(), Some("Check search compatibility"), "{format}");
+            assert_eq!(turn.first_response_sec(), Some(5), "{format}");
+            assert_eq!(turn.completion_sec(), Some(30), "{format}");
+            assert_eq!(analytics.prompt_lengths, vec![26], "{format}");
+            assert_eq!(analytics.tool_types.get("web_search"), Some(&2), "{format}");
+            assert_eq!(analytics.search_hours.iter().sum::<i64>(), 2, "{format}");
+            assert_eq!(analytics.search_terms.get("compatibility"), Some(&1), "{format}");
+            // Prefer recorded first-token latency over the later completed-message timestamp.
+            events.last_mut().unwrap()["payload"]["time_to_first_token_ms"] = json!(3200);
+            let analytics = analytics_from_jsonl(events);
+            assert_eq!(analytics.turns[0].first_response_sec(), Some(3), "{format}");
+        }
+    }
 
     #[test]
     fn reads_metrics_from_array_tool_outputs() {

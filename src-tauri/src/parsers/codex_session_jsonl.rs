@@ -20,7 +20,7 @@ impl SourceParser for CodexSessionJsonlParser {
     }
 
     fn version(&self) -> &'static str {
-        "5"
+        "6"
     }
 
     fn supports(&self, target: &ParserTarget) -> u8 {
@@ -261,7 +261,24 @@ fn compact_codex_event_payload(outer_type: &str, payload: &Value) -> String {
                 payload.get("message").and_then(Value::as_str),
             );
         }
+        ("response_item", "message") => {
+            let role = payload.get("role").and_then(Value::as_str);
+            if matches!(role, Some("user" | "assistant")) {
+                let text = visible_message_text(payload);
+                if !payload.get("content").and_then(extract_text)
+                    .as_deref().is_some_and(is_internal_scaffold_message)
+                {
+                    insert_string(&mut compact, "role", role);
+                    insert_string(&mut compact, "text", text.as_deref());
+                }
+            }
+        }
         ("event_msg", "task_complete") => {
+            insert_i64(
+                &mut compact,
+                "time_to_first_token_ms",
+                payload.get("time_to_first_token_ms").and_then(Value::as_i64),
+            );
             insert_i64(
                 &mut compact,
                 "completed_at",
@@ -630,6 +647,10 @@ fn compact_completed_item(item: &Value) -> Value {
         "readOnlyHint",
         item.get("readOnlyHint").and_then(Value::as_bool),
     );
+    if matches!(item.get("type").and_then(Value::as_str), Some("UserMessage" | "AgentMessage")) {
+        let text = visible_message_text(item);
+        insert_string(&mut compact, "text", text.as_deref());
+    }
     if let Some(duration) = item.get("duration") {
         compact.insert("duration".to_string(), duration.clone());
     }
@@ -1027,6 +1048,13 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     output
 }
 
+fn visible_message_text(payload: &Value) -> Option<String> {
+    payload.get("content").and_then(extract_text)
+        .filter(|text| !is_internal_scaffold_message(text))
+        .map(|text| strip_image_placeholders(&text))
+        .filter(|text| !text.is_empty())
+}
+
 fn extract_response_message(payload: &Value, timestamp: Option<String>) -> Option<ParsedMessage> {
     let role = payload.get("role").and_then(Value::as_str)?;
     if matches!(role, "developer" | "system") {
@@ -1082,6 +1110,8 @@ fn strip_image_placeholders(text: &str) -> String {
 fn is_internal_scaffold_message(text: &str) -> bool {
     let trimmed = text.trim_start();
     [
+        "# AGENTS.md instructions",
+        "<turn_aborted>",
         "<environment_context>",
         "<environment_context",
         "<permissions instructions>",
@@ -1226,6 +1256,28 @@ mod tests {
         assert!(message.media[0]
             .source
             .starts_with("data:image/webp;base64,"));
+    }
+
+    #[test]
+    fn preserves_visible_message_text_without_media_or_private_context() {
+        let payload = json!({"type":"message", "role":"user", "content":[
+            {"type":"input_text", "text":"Describe this image"},
+            {"type":"input_image", "image_url":"data:image/png;base64,PRIVATE_IMAGE"}
+        ]});
+        let compact: serde_json::Value = serde_json::from_str(&compact_codex_event_payload("response_item", &payload)).unwrap();
+        assert_eq!(compact["text"], "Describe this image");
+        assert_eq!(compact["role"], "user");
+        assert!(!compact.to_string().contains("PRIVATE_IMAGE"));
+        for role in ["developer", "system"] {
+            let compact = compact_codex_event_payload("response_item", &json!({
+                "type":"message", "role":role, "content":[{"type":"input_text", "text":"private instructions"}]
+            }));
+            assert!(!compact.contains("private instructions"));
+        }
+        let compact = compact_codex_event_payload("event_msg", &json!({
+            "type":"item_completed", "item":{"type":"UserMessage", "content":[{"type":"text", "text":"<environment_context>private</environment_context>"}]}
+        }));
+        assert!(!compact.contains("private"));
     }
 
     #[test]

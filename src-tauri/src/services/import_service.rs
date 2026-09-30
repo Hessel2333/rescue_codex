@@ -26,7 +26,7 @@ use crate::{
     state::AppState,
 };
 
-const PARSER_REGISTRY_VERSION: &str = "registry-3";
+const PARSER_REGISTRY_VERSION: &str = "registry-4";
 
 struct ImportPlan {
     files: Vec<PathBuf>,
